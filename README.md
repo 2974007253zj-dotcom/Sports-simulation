@@ -1,7 +1,7 @@
 # NekoSportsWorldTool
 
-![Release](https://img.shields.io/github/v/release/liming2500/NekoSportsWorldTool)
-![Build](https://github.com/liming2500/NekoSportsWorldTool/actions/workflows/release.yml/badge.svg)
+![Release](https://img.shields.io/github/v/release/liing6666/Sports-simulation)
+![Build](https://github.com/liing6666/Sports-simulation/actions/workflows/release.yml/badge.svg)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Android-blue)
 
 运动世界校园版全协议自动化工具，纯 Rust 实现，桌面端 GUI / CLI 双模式，并提供 Android 客户端。
@@ -10,14 +10,14 @@
 
 ## 下载
 
-前往 [Releases](https://github.com/liming2500/NekoSportsWorldTool/releases) 下载：
+前往 [Releases](https://github.com/liing6666/Sports-simulation/releases) 下载：
 
 | 平台 | 文件 |
 | --- | --- |
 | Windows x64 | `NekoSportsWorldTool-win-x64.zip` |
 | Android arm64 | `NekoSportsWorldTool-android-arm64.apk` |
 
-Windows 解压后双击 `nekosportsworldtool.exe` 即可运行；Android 直接安装 APK（首次需允许“安装未知应用”）。
+Windows 解压后双击 `sportssimulation.exe` 即可运行；Android 直接安装 APK（首次需允许“安装未知应用”）。
 
 ## 功能
 
@@ -37,7 +37,7 @@ Windows 解压后双击 `nekosportsworldtool.exe` 即可运行；Android 直接�
 
 ### GUI
 
-双击 `nekosportsworldtool.exe`，在界面中登录并配置跑步参数，点击开始即可。账号、设备身份和配置保存在程序同目录的 JSON 文件中。
+双击 `sportssimulation.exe`，在界面中登录并配置跑步参数，点击开始即可。账号、设备身份和配置保存在程序同目录的 JSON 文件中。
 
 ### CLI
 
@@ -79,7 +79,7 @@ cargo build --release                        # GUI + CLI
 cargo build --release --no-default-features  # 仅 CLI
 ```
 
-产物位于 `target/release/nekosportsworldtool.exe`。
+产物位于 `target/release/sportssimulation.exe`。
 
 ### Android
 
@@ -106,8 +106,8 @@ cargo test --all
 - **10121 设备风险**：设备身份会持久化，删除 `identity.json` 等于换新设备，不要频繁删除
 - **10603 点位限流**：点位接口 5 分钟限 3 次，程序内置 300s 缓存，正常使用不会触发
 - **榜单为空**：当天还没有人产生有效里程，查询会自动回退最近 3 天
-- **检查更新失败**：更新仅直连 GitHub，网络不通时到 [Releases](https://github.com/liming2500/NekoSportsWorldTool/releases) 手动下载
-- **手动更新**：Windows 下载新的 `nekosportsworldtool.exe` 后退出软件替换旧文件；请保留 `config.json`、`identity.json`、`points_cache.json` 等配置文件
+- **检查更新失败**：更新仅直连 GitHub，网络不通时到 [Releases](https://github.com/liing6666/Sports-simulation/releases) 手动下载
+- **手动更新**：Windows 下载新的 `sportssimulation.exe` 后退出软件替换旧文件；请保留 `config.json`、`identity.json`、`points_cache.json` 等配置文件
 - **人机验证失败**：自动重试 3 轮，仍失败大概率是网络波动，稍后再试
 - **杀软误报**：未签名编译产物可能被误报，请自行判断后加白
 

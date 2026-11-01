@@ -8,11 +8,11 @@
 
 use crate::api::client::{make_agent, ureq_err};
 
-pub const REPO_UPSTREAM: &str = "liming2500/NekoSportsWorldTool";
+pub const REPO_UPSTREAM: &str = "liing6666/Sports-simulation";
 /// Android 端额外查询的仓库；与上游相同，保留该常量以兼容既有分支逻辑。
-pub const REPO_FORK: &str = "liming2500/NekoSportsWorldTool";
+pub const REPO_FORK: &str = "liing6666/Sports-simulation";
 
-const UA: &str = concat!("NekoSportsWorldTool/", env!("CARGO_PKG_VERSION"));
+const UA: &str = concat!("Sports simulation/", env!("CARGO_PKG_VERSION"));
 
 /// Android 更新包落盘文件名（私有目录，ApkProvider 只暴露这一个文件）。
 pub const APK_NAME: &str = "update.apk";
@@ -36,11 +36,11 @@ fn repos() -> Vec<String> {
 /// 当前平台对应的 Release 资产名；无匹配产物的平台返回 None。
 pub fn asset_name() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("windows", "x86_64") => Some("NekoSportsWorldTool-win-x64.zip"),
-        ("macos", "aarch64") => Some("NekoSportsWorldTool-macos-arm64.tar.gz"),
-        ("linux", "x86_64") => Some("NekoSportsWorldTool-linux-x64.tar.gz"),
-        ("linux", "aarch64") => Some("NekoSportsWorldTool-linux-aarch64.tar.gz"),
-        ("android", "aarch64") => Some("NekoSportsWorldTool-android-arm64.apk"),
+        ("windows", "x86_64") => Some("Sports-simulation-win-x64.zip"),
+        ("macos", "aarch64") => Some("Sports-simulation-macos-arm64.tar.gz"),
+        ("linux", "x86_64") => Some("Sports-simulation-linux-x64.tar.gz"),
+        ("linux", "aarch64") => Some("Sports-simulation-linux-aarch64.tar.gz"),
+        ("android", "aarch64") => Some("Sports-simulation-android-arm64.apk"),
         _ => None,
     }
 }
@@ -244,7 +244,7 @@ pub fn download(url: &str, mut progress: impl FnMut(u64, Option<u64>)) -> Result
 }
 
 /// 从发布包解出新程序二进制。桌面：zip 内找 *.exe（7z 打包带 target/
-/// 目录前缀，取最大的一条）；tar.gz 内找根级 nekosportsworldtool。
+/// 目录前缀，取最大的一条）；tar.gz 内找根级 sportssimulation。
 #[cfg(not(target_os = "android"))]
 pub fn extract(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     if asset_name.ends_with(".zip") {
@@ -307,7 +307,7 @@ fn extract_tar_gz(bytes: &[u8]) -> Result<Vec<u8>, String> {
             continue;
         }
         let path = e.path().map_err(|e| format!("tar 路径异常: {e}"))?;
-        if path.file_name().and_then(|n| n.to_str()) != Some("nekosportsworldtool") {
+        if path.file_name().and_then(|n| n.to_str()) != Some("sportssimulation") {
             continue;
         }
         let mut out = Vec::new();
@@ -404,24 +404,24 @@ mod tests {
             })
         };
         let exact = pick_asset(
-            &mk(&["NekoSportsWorldTool-win-x64.zip", "other.txt"]),
-            "NekoSportsWorldTool-win-x64.zip",
+            &mk(&["Sports-simulation-win-x64.zip", "other.txt"]),
+            "Sports-simulation-win-x64.zip",
         );
-        assert_eq!(exact.unwrap().name, "NekoSportsWorldTool-win-x64.zip");
+        assert_eq!(exact.unwrap().name, "Sports-simulation-win-x64.zip");
         // 桌面产物必须精确匹配
-        assert!(pick_asset(&mk(&["wrong.zip"]), "NekoSportsWorldTool-win-x64.zip").is_none());
+        assert!(pick_asset(&mk(&["wrong.zip"]), "Sports-simulation-win-x64.zip").is_none());
         // APK 模糊匹配：先精确、再 arm64、再任意 apk
         let apk = pick_asset(
-            &mk(&["NekoSportsWorldTool-0.2.5-android.2-arm64.apk"]),
-            "NekoSportsWorldTool-android-arm64.apk",
+            &mk(&["Sports-simulation-0.2.5-android.2-arm64.apk"]),
+            "Sports-simulation-android-arm64.apk",
         );
         assert_eq!(
             apk.unwrap().name,
-            "NekoSportsWorldTool-0.2.5-android.2-arm64.apk"
+            "Sports-simulation-0.2.5-android.2-arm64.apk"
         );
         let any = pick_asset(
             &mk(&["app-arm64.apk", "plain.apk"]),
-            "NekoSportsWorldTool-android-arm64.apk",
+            "Sports-simulation-android-arm64.apk",
         );
         assert_eq!(any.unwrap().name, "app-arm64.apk");
     }
@@ -435,7 +435,7 @@ mod tests {
             let opt = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             w.start_file(
-                "target/x86_64-pc-windows-msvc/release/nekosportsworldtool.exe",
+                "target/x86_64-pc-windows-msvc/release/sportssimulation.exe",
                 opt,
             )
             .unwrap();
@@ -447,7 +447,7 @@ mod tests {
         let bytes = buf.into_inner();
         assert_eq!(extract_zip(&bytes).unwrap(), b"BIN_CONTENT");
         assert_eq!(
-            extract("NekoSportsWorldTool-win-x64.zip", &bytes).unwrap(),
+            extract("Sports-simulation-win-x64.zip", &bytes).unwrap(),
             b"BIN_CONTENT"
         );
     }
@@ -464,14 +464,14 @@ mod tests {
             hdr.set_size(content.len() as u64);
             hdr.set_mode(0o755);
             hdr.set_cksum();
-            tar.append_data(&mut hdr, "nekosportsworldtool", content)
+            tar.append_data(&mut hdr, "sportssimulation", content)
                 .unwrap();
             let gz = tar.into_inner().unwrap();
             gz.finish().unwrap();
         }
         assert_eq!(extract_tar_gz(&bytes).unwrap(), b"BIN_CONTENT");
         assert_eq!(
-            extract("NekoSportsWorldTool-linux-x64.tar.gz", &bytes).unwrap(),
+            extract("Sports-simulation-linux-x64.tar.gz", &bytes).unwrap(),
             b"BIN_CONTENT"
         );
     }

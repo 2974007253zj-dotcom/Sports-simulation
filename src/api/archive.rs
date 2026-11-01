@@ -85,7 +85,7 @@ pub fn build_gpx(name: &str, start_ms: i64, rows: &[TrackRow<'_>]) -> String {
     out.push_str(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
     out.push('\n');
     out.push_str(
-        r#"<gpx version="1.1" creator="NekoSportsWorldTool" xmlns="http://www.topografix.com/GPX/1/1">"#,
+        r#"<gpx version="1.1" creator="Sports simulation" xmlns="http://www.topografix.com/GPX/1/1">"#,
     );
     out.push('\n');
     out.push_str(&format!(
@@ -115,7 +115,7 @@ pub fn build_gpx(name: &str, start_ms: i64, rows: &[TrackRow<'_>]) -> String {
     // 补上自定义命名空间声明，否则 ns 前缀未定义，导入工具会报错。
     out.replace(
         "xmlns=\"http://www.topografix.com/GPX/1/1\">",
-        "xmlns=\"http://www.topografix.com/GPX/1/1\" xmlns:nsw=\"https://github.com/liming2500/NekoSportsWorldTool\">",
+        "xmlns=\"http://www.topografix.com/GPX/1/1\" xmlns:nsw=\"https://github.com/liing6666/Sports-simulation\">",
     )
 }
 

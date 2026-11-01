@@ -2369,39 +2369,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nekosportsworldtool"
-version = "0.5.0"
-dependencies = [
- "aes",
- "android-activity",
- "android_logger",
- "base64",
- "cbc",
- "chrono",
- "eframe",
- "egui",
- "egui_extras",
- "flate2",
- "image",
- "jni 0.21.1",
- "log",
- "md-5",
- "rand 0.8.8",
- "rand_distr",
- "rfd",
- "route-planner",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "ureq",
- "uuid",
- "winit",
- "zip",
-]
-
-[[package]]
 name = "nix"
 version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3777,6 +3744,39 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "sportssimulation"
+version = "0.5.0"
+dependencies = [
+ "aes",
+ "android-activity",
+ "android_logger",
+ "base64",
+ "cbc",
+ "chrono",
+ "eframe",
+ "egui",
+ "egui_extras",
+ "flate2",
+ "image",
+ "jni 0.21.1",
+ "log",
+ "md-5",
+ "rand 0.8.8",
+ "rand_distr",
+ "rfd",
+ "route-planner",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "ureq",
+ "uuid",
+ "winit",
+ "zip",
 ]
 
 [[package]]

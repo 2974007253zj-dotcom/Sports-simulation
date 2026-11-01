@@ -194,12 +194,12 @@ fn fetch_once(agent: &ureq::Agent, endpoint: &str, query: &str) -> Result<Vec<u8
         agent
             .get(endpoint)
             .query("bbox", &bbox)
-            .set("User-Agent", "NekoSportsWorldTool/0.4.1 (school-road-map)")
+            .set("User-Agent", "Sports simulation/0.4.1 (school-road-map)")
             .call()
     } else {
         agent
             .post(endpoint)
-            .set("User-Agent", "NekoSportsWorldTool/0.4.1 (school-road-map)")
+            .set("User-Agent", "Sports simulation/0.4.1 (school-road-map)")
             .send_form(&[("data", query)])
     };
     let response = request.map_err(fetch_error)?;
