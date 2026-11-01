@@ -1,6 +1,6 @@
 /target
 Cargo.lock.bak
-nekosportsworldtool.log*
+sportssimulation.log*
 *.log.old
 
 # 运行时数据（含会话/凭据，禁止入库）
@@ -47,3 +47,4 @@ docs/_preview.png
 # 自动更新替换残留
 *.exe.old
 *.exe.new
+/dist_20261029/
