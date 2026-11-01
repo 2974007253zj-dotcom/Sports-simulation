@@ -48,3 +48,6 @@ docs/_preview.png
 *.exe.old
 *.exe.new
 /dist_20261029/
+
+# APK 签名中间产物
+*.idsig

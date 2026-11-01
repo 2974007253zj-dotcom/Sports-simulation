@@ -33,13 +33,31 @@ fn free_console() {
 #[cfg(not(all(windows, feature = "gui")))]
 fn free_console() {}
 
+/// 窗口/任务栏图标。编译期内嵌 PNG，运行时解码为 egui 需要的 RGBA。
+#[cfg(feature = "gui")]
+fn window_icon() -> Option<eframe::egui::IconData> {
+    const PNG: &[u8] = include_bytes!("../assets/window_icon.png");
+    let img = image::load_from_memory_with_format(PNG, image::ImageFormat::Png).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    Some(eframe::egui::IconData {
+        rgba: rgba.into_raw(),
+        width: w,
+        height: h,
+    })
+}
+
 #[cfg(feature = "gui")]
 fn run_gui() {
     free_console();
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([880.0, 720.0])
+        .with_title("Sports simulation");
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
     let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 720.0])
-            .with_title("Sports simulation"),
+        viewport,
         ..Default::default()
     };
     let result = sportssimulation::run_gui(options);

@@ -1,4 +1,4 @@
-# NekoSportsWorldTool
+# Sports simulation
 
 ![Release](https://img.shields.io/github/v/release/liing6666/Sports-simulation)
 ![Build](https://github.com/liing6666/Sports-simulation/actions/workflows/release.yml/badge.svg)
@@ -14,10 +14,13 @@
 
 | 平台 | 文件 |
 | --- | --- |
-| Windows x64 | `NekoSportsWorldTool-win-x64.zip` |
-| Android arm64 | `NekoSportsWorldTool-android-arm64.apk` |
+| Windows x64 | `sportssimulation.exe`（可直接运行，或下载 `Sports-simulation-win-x64.zip`） |
+| Android arm64 | `Sports-simulation-android-arm64.apk` |
 
-Windows 解压后双击 `sportssimulation.exe` 即可运行；Android 直接安装 APK（首次需允许“安装未知应用”）。
+Windows 双击 `sportssimulation.exe` 即可运行；Android 直接安装 APK（首次需允许“安装未知应用”）。
+
+> **安卓用户注意**：本版应用包名已变更为 `org.sportssimulation.tool`，与旧版不是同一个应用，
+> **必须先卸载旧版再安装**。卸载会清除会话与设备身份，需重新登录。
 
 ## 功能
 
@@ -42,17 +45,17 @@ Windows 解压后双击 `sportssimulation.exe` 即可运行；Android 直接安�
 ### CLI
 
 ```text
-NekoSportsWorldTool login --user <手机号> --pass <密码> --remember
-NekoSportsWorldTool run                                  # 一键跑步（--altitude 17.2 固定海拔，或 11.6-22.8 映射到区间）
-NekoSportsWorldTool run --dry-run --dist 2 --pace 360 --lat 39.9 --lon 116.4
+Sports simulation login --user <手机号> --pass <密码> --remember
+Sports simulation run                                  # 一键跑步（--altitude 17.2 固定海拔，或 11.6-22.8 映射到区间）
+Sports simulation run --dry-run --dist 2 --pace 360 --lat 39.9 --lon 116.4
                                                          # 本地生成并校验轨迹/五点/OBS，不登录、不联网、不上传
-NekoSportsWorldTool run --track-color full-green         # 全绿色（默认）；也可选 half-green-gray
-NekoSportsWorldTool run --track loop:400                 # 固定跑道 400 米绕圈
-NekoSportsWorldTool ai --sport 2 --score 26000           # AI 运动
-NekoSportsWorldTool rank main --type 1 --sort 1          # 排行榜
-NekoSportsWorldTool update [--check]                     # 自动更新（--check 仅检查不下载）
-NekoSportsWorldTool template --file run.gpx              # 本地分析真实记录海拔（不会上传）
-NekoSportsWorldTool help                                 # 全部命令
+Sports simulation run --track-color full-green         # 全绿色（默认）；也可选 half-green-gray
+Sports simulation run --track loop:400                 # 固定跑道 400 米绕圈
+Sports simulation ai --sport 2 --score 26000           # AI 运动
+Sports simulation rank main --type 1 --sort 1          # 排行榜
+Sports simulation update [--check]                     # 自动更新（--check 仅检查不下载）
+Sports simulation template --file run.gpx              # 本地分析真实记录海拔（不会上传）
+Sports simulation help                                 # 全部命令
 ```
 
 `template` 只读取本地 GPX / JSON 文件，输出采样点、海拔范围、累计上升和下降，不会登录或上传数据。
@@ -66,6 +69,7 @@ NekoSportsWorldTool help                                 # 全部命令
 ### Android
 
 - 面向 Android 16（target SDK 36）的 ARM64 手机，最低 API 26。
+- 包名为 `org.sportssimulation.tool`；从旧版（`org.nekosportsworld.tool`）升级需先卸载旧版。
 - 点击账号、密码或数值字段会弹出系统输入法；数据保存在应用私有目录，卸载会清除。
 - 自更新：关于页可检查新版本，下载 APK 后调起系统安装器。
 - 首次安装需在系统设置中允许本应用“安装未知应用”。
@@ -90,7 +94,7 @@ rustup target add aarch64-linux-android
 ./android/build.ps1 -Abi arm64-v8a -Profile release
 ```
 
-产物位于 `android/build/arm64-v8a-release/NekoSportsWorldTool-arm64-v8a.apk`。详见 [android/README.md](android/README.md)。
+产物位于 `android/build/arm64-v8a-release/Sports-simulation-arm64-v8a.apk`。详见 [android/README.md](android/README.md)。
 
 ### 测试
 
