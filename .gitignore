@@ -51,3 +51,10 @@ docs/_preview.png
 
 # APK 签名中间产物
 *.idsig
+
+# 设备身份核对临时文件（内容与 session.json 相同，含 Token）
+/ident_backup_check.tmp
+/*.tmp
+
+# 发布打包产物
+/dist/

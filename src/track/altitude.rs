@@ -6,7 +6,7 @@
 
 #![allow(non_snake_case)]
 
-use super::geom::round_to;
+use super::geom::{round_to, Rng};
 use super::model::Track;
 
 pub const ASCENT_NOISE_THRESHOLD_M: f64 = 0.15;
@@ -79,17 +79,79 @@ fn validate_range(min_m: f64, max_m: f64) -> Result<AltitudeRange, String> {
     Ok(AltitudeRange { min_m, max_m })
 }
 
+/// 单值海拔叠加的地形起伏标准差（米）。
+///
+/// 只用区间映射时，用户填"17.2"会把整条轨迹写成同一个海拔：`totalAscent=0`、
+/// 每圈 `elevationGain=0`，服务端会判「运动数据有问题」。真实 GPS 海拔在
+/// 3-7m 量级持续起伏（实测自动海拔轨迹的 SD 为 5.2-7.8m）。
+pub const SINGLE_ALTITUDE_TERRAIN_SD_M: f64 = 4.5;
+/// 单值海拔的地形起伏上下限（米，相对用户输入值）。
+pub const SINGLE_ALTITUDE_TERRAIN_SPAN_M: f64 = 18.0;
+
 /// 将轨迹所有点的百度海拔覆盖为用户输入的绝对海拔（米）。
 ///
 /// 返回 `Err` 而不是静默接受 NaN/无穷值，避免生成不可序列化或被服务端
 /// 拒绝的提交。海拔范围采用常见地表范围，既能覆盖地下场地也能覆盖高原。
+///
+/// 覆盖的是**均值**：每个点保留 AR(1) 缓变地形 + 小测量噪声，最终整体平移
+/// 使平均海拔恰好等于用户输入值。恒定海拔是明确的风控特征，不能原样写入。
 pub fn override_bd_a(track: &mut Track, altitude_m: f64) -> Result<(), String> {
     validate_altitude(altitude_m)?;
-    for point in &mut track.locations {
-        point.bdA = round_to(altitude_m, 2);
+    let seed = (track.startTime as u64)
+        ^ ((track.locations.len() as u64) << 32)
+        ^ 0x5DEE_CE66_D1CE_4E5B;
+    let mut rng = Rng::new(seed);
+    // 缓变地形：AR(1) 系数高 → 相邻点连续，不会出现锯齿状海拔。
+    let phi = 0.97f64;
+    let innovation_sd = SINGLE_ALTITUDE_TERRAIN_SD_M * (1.0f64 - phi * phi).sqrt();
+    let mut drift = 0.0f64;
+    let mut raw: Vec<f64> = Vec::with_capacity(track.locations.len());
+    for _ in &track.locations {
+        drift = phi * drift + rng.gauss(0.0, innovation_sd);
+        let noise = rng.gauss(0.0, 0.5);
+        let clamped = (drift + noise).clamp(
+            -SINGLE_ALTITUDE_TERRAIN_SPAN_M,
+            SINGLE_ALTITUDE_TERRAIN_SPAN_M,
+        );
+        raw.push(clamped);
+    }
+    // 整体平移，使平均海拔等于用户输入值（起伏全部保留）。
+    let mean = if raw.is_empty() {
+        0.0
+    } else {
+        raw.iter().sum::<f64>() / raw.len() as f64
+    };
+    for (point, offset) in track.locations.iter_mut().zip(raw) {
+        point.bdA = round_to(altitude_m + offset - mean, 2);
         point.hasAltitude = true;
     }
     Ok(())
+}
+
+/// 由逐点速度与已跑里程给出步频目标（步/分）。
+///
+/// 直接复用 `route-planner` 的生物力学模型，该公式由 4 条真实记录拟合：
+/// `cadence = 34.4 + 44.5·v`，配速 8:19/km→125、7:02→139、6:40→144、5:31→170。
+/// 老公式 `150 + 12v` 在 6:40/km 给出 180 步/分（实测 144），正是 2026-10
+/// 三条记录被判「运动数据有问题」的原因。
+pub fn cadence_target(v_ms: f64, km_done: f64) -> f64 {
+    route_planner::gait(v_ms.max(0.0), route_planner::fatigue_from_km(km_done)).cadence
+}
+
+/// 给生成器用的完整海拔序列：缓变地形 + 测量噪声，稳态标准差约 `sd_m`。
+///
+/// 生成器直接累加出逐点海拔，避免"先生成再覆盖"造成的两条不一致的曲线。
+pub fn terrain_series(n: usize, sd_m: f64, phi: f64, rng: &mut Rng) -> Vec<f64> {
+    let phi = phi.clamp(0.0, 0.999);
+    let innovation = sd_m * (1.0f64 - phi * phi).sqrt();
+    let span = (sd_m * 3.0).max(1.0);
+    let mut drift = 0.0f64;
+    (0..n)
+        .map(|_| {
+            drift = phi * drift + rng.gauss(0.0, innovation);
+            (drift + rng.gauss(0.0, sd_m * 0.15)).clamp(-span, span)
+        })
+        .collect()
 }
 
 /// 将生成器的海拔曲线平滑映射到用户指定的绝对海拔区间。
@@ -125,11 +187,41 @@ mod tests {
     }
 
     #[test]
-    fn override_replaces_every_bd_a_and_clears_ascent() {
+    fn override_keeps_the_mean_but_adds_terrain() {
         let mut track = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points());
         override_bd_a(&mut track, 36.75).unwrap();
-        assert!(track.locations.iter().all(|p| p.bdA == 36.75));
-        assert_eq!(total_ascent(&track.locations), 0.0);
+        // 均值仍等于用户输入值
+        let mean = track.locations.iter().map(|p| p.bdA).sum::<f64>() / track.locations.len() as f64;
+        assert!((mean - 36.75).abs() < 0.5, "mean={mean}");
+        // 但海拔不再恒定：必须有起伏，爬升和下降都不能为 0
+        let uniq: std::collections::HashSet<i64> =
+            track.locations.iter().map(|p| (p.bdA * 100.0) as i64).collect();
+        assert!(uniq.len() > 5, "海拔只有 {} 个取值，仍是直线", uniq.len());
+        let ascent = total_ascent(&track.locations);
+        assert!(ascent > 5.0, "爬升 {ascent} 太小，仍会被判异常");
+        let mut prev = track.locations[0].bdA;
+        let mut descent = 0.0;
+        for p in track.locations.iter().skip(1) {
+            if p.bdA < prev {
+                descent += prev - p.bdA;
+            }
+            prev = p.bdA;
+        }
+        assert!(descent > 5.0, "下降 {descent} 太小，海拔只升不降同样异常");
+    }
+
+    #[test]
+    fn override_is_deterministic_for_the_same_track() {
+        let points = points();
+        let a = build(1200.0, 600, 7, (38.9, 121.54), 1_700_000_000_000, &points);
+        let b = a.clone();
+        let mut a = a;
+        let mut b = b;
+        override_bd_a(&mut a, 36.75).unwrap();
+        override_bd_a(&mut b, 36.75).unwrap();
+        let va: Vec<f64> = a.locations.iter().map(|p| p.bdA).collect();
+        let vb: Vec<f64> = b.locations.iter().map(|p| p.bdA).collect();
+        assert_eq!(va, vb);
     }
 
     #[test]

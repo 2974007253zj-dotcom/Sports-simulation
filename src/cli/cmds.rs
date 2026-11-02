@@ -305,7 +305,7 @@ fn cmd_run(rest: &[&str]) -> i32 {
         return match crate::api::flow::run_dry_run(&params, anchor) {
             Ok(summary) => {
                 println!(
-                    "√ dry-run 通过：{:.0}m / {}s / {} 点 / OBS 2 key\n  起点 ({:.6},{:.6})  速度 {:.2}-{:.2} m/s\n  未登录、未联网、未上传",
+                    "√ dry-run 通过：{:.0}m / {}s / {} 点 / OBS 2 key\n  起点 ({:.6},{:.6})  速度 {:.2}-{:.2} m/s\n  风控自检通过（步数密度/海拔/瞬移/步频相关）\n  未登录、未联网、未上传",
                     summary.distance_m,
                     summary.duration_s,
                     summary.track_points,
@@ -314,6 +314,9 @@ fn cmd_run(rest: &[&str]) -> i32 {
                     summary.min_speed_mps,
                     summary.max_speed_mps
                 );
+                for note in &summary.preflight_notes {
+                    println!("  ⚠ {note}");
+                }
                 0
             }
             Err(e) => {

@@ -74,10 +74,23 @@ pub fn export_json(book: &ProfileBook, include_password: bool) -> Result<String,
             for slot in items {
                 if let Some(obj) = slot.as_object_mut() {
                     obj.remove("password");
+                    // 设备身份是账号的设备指纹，导入到别的机器上会与导出方共用
+                    // DeviceId（被判同设备多开）。脱敏导出时一并去掉，
+                    // 导入方会按 migrate/apply 逻辑生成自己的指纹。
                     // remember_password 只对密码有意义；脱敏后一并去掉，避免导入后
                     // 应用该档位时把「记住的密码」当成空串写回 config。
                     obj.remove("remember_password");
                 }
+            }
+        }
+    }
+    // 设备身份**无论如何都不导出**：它是账号在本机的设备指纹，导入到别的机器
+    // 会与导出方共用同一 DeviceId，被服务端判成「同设备多开」。导入方会按
+    // migrate/apply 逻辑生成自己的指纹，不需要也不应该继承。
+    if let Some(items) = slots.as_array_mut() {
+        for slot in items {
+            if let Some(obj) = slot.as_object_mut() {
+                obj.remove("identity");
             }
         }
     }
@@ -198,6 +211,16 @@ pub struct ProfileSlot {
     pub custom_loop: bool,
     #[serde(default)]
     pub custom_laps: i64,
+
+    // ---- 设备身份（每个账号单独保存） ----
+    //
+    /// 该档位绑定的设备身份快照。
+    ///
+    /// 服务端按 DeviceId / MAC / 安装时间识别设备，同一设备频繁切换账号会触发
+    /// 10121「已在其他设备登录」。把身份跟着档位走，每个账号才能有稳定且互不
+    /// 相同的设备指纹；`None` 表示该档位不管理设备身份（沿用全局 identity.json）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<crate::crypto::header::HeaderIdentity>,
 }
 
 impl Default for ProfileSlot {
@@ -225,6 +248,7 @@ impl Default for ProfileSlot {
             custom_destination: String::new(),
             custom_loop: true,
             custom_laps: 0,
+            identity: None,
         }
     }
 }
@@ -258,7 +282,14 @@ impl ProfileBook {
     }
 
     /// 从当前 Config 抓一份快照，用于「保存为档位」。
-    pub fn capture(name: &str, config: &crate::api::model::Config) -> ProfileSlot {
+    ///
+    /// `identity` 为当前设备身份；只有档位绑定了账号时才一并保存——纯参数档位
+    /// 不携带设备身份，否则切换参数会顺带换掉设备指纹。
+    pub fn capture(
+        name: &str,
+        config: &crate::api::model::Config,
+        identity: Option<&crate::crypto::header::HeaderIdentity>,
+    ) -> ProfileSlot {
         ProfileSlot {
             name: name.to_string(),
             username: config.username.clone(),
@@ -287,6 +318,11 @@ impl ProfileBook {
             custom_destination: config.custom_destination.clone(),
             custom_loop: config.custom_loop,
             custom_laps: config.custom_laps,
+            identity: if config.username.is_empty() {
+                None
+            } else {
+                identity.cloned()
+            },
         }
     }
 
@@ -326,6 +362,91 @@ impl ProfileBook {
         config.custom_loop = slot.custom_loop;
         config.custom_laps = slot.custom_laps;
     }
+
+    /// 老数据迁移：给绑定了账号、但还没有设备身份的档位补一份。
+    ///
+    /// 升级前所有档位共用全局 `identity.json`，谁先登录谁的指纹就留在全局里。
+    /// 迁移时把**当前登录账号**对应档位继承这份全局身份（保证它不掉登录态），
+    /// 其余账号各生成一套独立指纹——共用同一 DeviceId 会被判「同设备多开」。
+    ///
+    /// 返回补了新身份的档位数量；`0` 表示无需迁移。
+    pub fn migrate_identities(
+        &mut self,
+        current_username: &str,
+        global: &crate::crypto::header::HeaderIdentity,
+    ) -> usize {
+        let mut assigned_global = false;
+        let mut changed = 0;
+        for slot in self.slots.iter_mut() {
+            if slot.identity.is_some() || slot.username.trim().is_empty() {
+                continue;
+            }
+            if !assigned_global && slot.username == current_username {
+                slot.identity = Some(global.clone());
+                assigned_global = true;
+            } else {
+                let mut id = global.clone();
+                refresh_fingerprint(&mut id);
+                slot.identity = Some(id);
+            }
+            changed += 1;
+        }
+        changed
+    }
+
+    /// 应用档位时同步设备身份。
+    ///
+    /// 返回 `Ok(Some(提示))` 表示身份已切换（提示里说明发生了什么），
+    /// `Ok(None)` 表示该档位不管理身份、无需改动。
+    ///
+    /// 关键约束：服务端按 DeviceId 识别「同一设备」，两个账号共用同一个
+    /// DeviceId 会被判成同设备多开。因此当档位里的 DeviceId 与**其他档位**
+    /// 冲突时，复制一份并换新 DeviceId / MAC / 安装时间，保证每账号独立。
+    pub fn apply_identity(
+        book: &ProfileBook,
+        index: usize,
+        global: &crate::crypto::header::HeaderIdentity,
+    ) -> Result<Option<crate::crypto::header::HeaderIdentity>, String> {
+        let Some(slot) = book.slots.get(index) else {
+            return Ok(None);
+        };
+        let Some(stored) = slot.identity.clone() else {
+            // 没存过身份：以当前全局身份为模板，但换一套独立的指纹。
+            // 直接沿用全局身份会和其他账号撞 DeviceId。
+            let mut id = global.clone();
+            refresh_fingerprint(&mut id);
+            return Ok(Some(id));
+        };
+        let mut id = stored;
+        // 与其他档位冲突则只换指纹，保留用户在设备页手动填的机型/系统版本。
+        let clash = book
+            .slots
+            .iter()
+            .enumerate()
+            .any(|(i, s)| i != index && s.identity.as_ref().map(|x| &x.device_id) == Some(&id.device_id));
+        if clash {
+            refresh_fingerprint(&mut id);
+        }
+        Ok(Some(id))
+    }
+
+    /// 把身份写回档位（应用档位后调用，保证刷新过的指纹被持久化）。
+    pub fn store_identity(&mut self, index: usize, id: crate::crypto::header::HeaderIdentity) {
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.identity = Some(id);
+        }
+    }
+}
+
+/// 换一套设备指纹：新 DeviceId / MAC / 安装时间，保留机型与系统版本。
+///
+/// 只替换服务端用来识别「设备」的字段，用户手动填写的品牌机型保持不变。
+pub fn refresh_fingerprint(id: &mut crate::crypto::header::HeaderIdentity) {
+    id.device_id = uuid::Uuid::new_v4().to_string().to_uppercase();
+    id.mac_address = crate::crypto::header::random_mac();
+    // 与首次生成同源：安卓回溯 90 天、iOS 3 天（单位毫秒），
+    // 两者不同是为了贴合平台各自的应用安装时间分布。
+    id.app_install_time = crate::crypto::header::HeaderIdentity::fresh_install_time(&id.platform);
 }
 
 #[cfg(test)]
@@ -381,9 +502,154 @@ mod tests {
             remember: false,
             ..Default::default()
         };
-        let slot = ProfileBook::capture("x", &config);
+        let slot = ProfileBook::capture("x", &config, None);
         assert!(slot.password.is_empty(), "未勾选记住密码时不应保存密码");
         assert!(!slot.remember_password);
+    }
+
+    fn identity_with(device_id: &str) -> crate::crypto::header::HeaderIdentity {
+        crate::crypto::header::HeaderIdentity {
+            device_id: device_id.into(),
+            mac_address: "08:a4:00:00:00:01".into(),
+            device_name: "Redmi K60".into(),
+            ..Default::default()
+        }
+    }
+
+    fn book_with_two_accounts() -> ProfileBook {
+        let mut book = ProfileBook::default();
+        book.slots.push(ProfileSlot {
+            name: "账号A".into(),
+            username: "13800000000".into(),
+            identity: Some(identity_with("DEVICE-A")),
+            ..Default::default()
+        });
+        book.slots.push(ProfileSlot {
+            name: "账号B".into(),
+            username: "13900000000".into(),
+            identity: Some(identity_with("DEVICE-B")),
+            ..Default::default()
+        });
+        book
+    }
+
+    #[test]
+    fn each_account_keeps_its_own_device_identity() {
+        let book = book_with_two_accounts();
+        let global = identity_with("GLOBAL");
+        let a = ProfileBook::apply_identity(&book, 0, &global).unwrap().unwrap();
+        let b = ProfileBook::apply_identity(&book, 1, &global).unwrap().unwrap();
+        assert_eq!(a.device_id, "DEVICE-A");
+        assert_eq!(b.device_id, "DEVICE-B");
+        assert_ne!(a.device_id, b.device_id, "两个账号不能共用同一个 DeviceId");
+    }
+
+    #[test]
+    fn slot_without_identity_gets_a_fresh_fingerprint() {
+        let book = ProfileBook::default();
+        let global = identity_with("GLOBAL");
+        let id = ProfileBook::apply_identity(&book, 0, &global).unwrap();
+        // 越界下标返回 None
+        assert!(id.is_none());
+
+        let mut book = ProfileBook::default();
+        book.slots.push(ProfileSlot {
+            name: "纯参数".into(),
+            ..Default::default()
+        });
+        let got = ProfileBook::apply_identity(&book, 0, &global).unwrap().unwrap();
+        assert_ne!(got.device_id, "GLOBAL", "沿用全局身份会与其他账号撞 DeviceId");
+        assert!(uuid::Uuid::parse_str(&got.device_id).is_ok());
+        assert!(!got.mac_address.is_empty());
+        assert!(got.app_install_time > 0);
+        // 用户填写的机型必须保留
+        assert_eq!(got.device_name, global.device_name);
+    }
+
+    #[test]
+    fn duplicated_device_id_is_replaced_to_avoid_sharing() {
+        let mut book = book_with_two_accounts();
+        // 人为制造冲突：档位 B 复制了 A 的 DeviceId
+        book.slots[1].identity = Some(identity_with("DEVICE-A"));
+        let id = ProfileBook::apply_identity(&book, 1, &identity_with("G")).unwrap().unwrap();
+        assert_ne!(id.device_id, "DEVICE-A", "冲突时必须换新 DeviceId");
+        assert!(uuid::Uuid::parse_str(&id.device_id).is_ok());
+        // 机型等用户可编辑字段保留
+        assert_eq!(id.device_name, "Redmi K60");
+        // 另一个档位不受影响
+        assert_eq!(book.slots[0].identity.as_ref().unwrap().device_id, "DEVICE-A");
+    }
+
+    #[test]
+    fn capture_stores_identity_only_for_account_slots() {
+        let identity = identity_with("DEV");
+        let with_account = Config {
+            username: "13800000000".into(),
+            ..Default::default()
+        };
+        let slot = ProfileBook::capture("x", &with_account, Some(&identity));
+        assert_eq!(slot.identity.as_ref().unwrap().device_id, "DEV");
+
+        let param_only = Config::default();
+        let slot = ProfileBook::capture("y", &param_only, Some(&identity));
+        assert!(slot.identity.is_none(), "纯参数档位不应携带设备身份");
+    }
+
+    #[test]
+    fn migration_keeps_logged_in_account_and_splits_the_rest() {
+        let global = identity_with("GLOBAL-DEV");
+        let mut book = ProfileBook::default();
+        for (name, user) in [("slotA", "13800000001"), ("slotB", "13800000002"), ("slotC", "13800000003")] {
+            book.slots.push(ProfileSlot {
+                name: name.into(),
+                username: user.into(),
+                ..Default::default()
+            });
+        }
+        let n = book.migrate_identities("13800000001", &global);
+        assert_eq!(n, 3);
+        // 当前登录账号继承原设备身份，不掉登录态
+        assert_eq!(book.slots[0].identity.as_ref().unwrap().device_id, "GLOBAL-DEV");
+        // 其余账号各自独立，且都不是 GLOBAL-DEV
+        let b = book.slots[1].identity.as_ref().unwrap().device_id.clone();
+        let c = book.slots[2].identity.as_ref().unwrap().device_id.clone();
+        assert_ne!(b, "GLOBAL-DEV");
+        assert_ne!(c, "GLOBAL-DEV");
+        assert_ne!(b, c);
+        // 幂等：再跑一次不改任何东西
+        assert_eq!(book.migrate_identities("13800000001", &global), 0);
+    }
+
+    #[test]
+    fn migration_skips_parameter_only_slots() {
+        let mut book = ProfileBook::default();
+        book.slots.push(ProfileSlot {
+            name: "纯参数".into(),
+            ..Default::default()
+        });
+        assert_eq!(book.migrate_identities("13800000001", &identity_with("G")), 0);
+        assert!(book.slots[0].identity.is_none());
+    }
+
+    #[test]
+    fn refresh_fingerprint_keeps_user_editable_fields() {
+        let mut id = identity_with("OLD");
+        id.city = "绵阳市".into();
+        id.manufacturer = "Xiaomi".into();
+        refresh_fingerprint(&mut id);
+        assert_ne!(id.device_id, "OLD");
+        assert_eq!(id.city, "绵阳市");
+        assert_eq!(id.manufacturer, "Xiaomi");
+        assert_eq!(id.device_name, "Redmi K60");
+    }
+
+    #[test]
+    fn old_profiles_json_without_identity_still_loads() {
+        // 兼容既有 profiles.json：没有 identity 字段的档位必须能反序列化。
+        let text = r#"{"slots":[{"name":"旧档位","username":"138","dist_min":2.0}],"active":0}"#;
+        let book: ProfileBook = serde_json::from_str(text).unwrap();
+        assert_eq!(book.slots.len(), 1);
+        assert!(book.slots[0].identity.is_none());
     }
 
     #[test]
@@ -454,6 +720,23 @@ mod tests {
         // 非密码字段要保留。
         assert_eq!(value["slots"][0]["username"], "13800000000");
         assert_eq!(value["slots"][0]["name"], "账号A");
+    }
+
+    #[test]
+    fn redacted_export_strips_device_identity() {
+        let mut book = ProfileBook::default();
+        book.slots.push(ProfileSlot {
+            name: "账号A".into(),
+            username: "138".into(),
+            identity: Some(identity_with("SECRET-DEVICE")),
+            ..Default::default()
+        });
+        let text = export_json(&book, false).unwrap();
+        assert!(!text.contains("SECRET-DEVICE"), "脱敏导出泄漏了设备 ID");
+        assert!(!text.contains("\"identity\""));
+        // 保留密码时仍不导出身份（身份与密码开关无关）
+        let with_pw = export_json(&book, true).unwrap();
+        assert!(!with_pw.contains("SECRET-DEVICE"), "导出设备身份会让导入方共用同一指纹");
     }
 
     #[test]

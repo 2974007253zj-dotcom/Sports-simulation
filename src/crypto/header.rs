@@ -14,7 +14,9 @@ pub const UA_IOS: &str = "SWCampus/7.3.40 (iPhone; iOS 18.1; Scale/3.00)";
 pub const UA_ANDROID: &str = "Mozilla/5.0 (Linux; Android 14; 22081212C Build/UKQ1.231003.002) AppleWebKit/537.36 SWCampus/7.3.70";
 
 /// 设备身份。app_install_time <= 0 表示尚未生成。
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+///
+/// `PartialEq` 供配置档位比较（判断档位是否管理设备身份、指纹是否冲突）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct HeaderIdentity {
     #[serde(default = "default_platform")]
     pub platform: String, // "ios" | "android"

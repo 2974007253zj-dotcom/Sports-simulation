@@ -869,7 +869,10 @@ fn build_from_route_at(
     let mut steps_acc = 0.0f64;
     let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
-    let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
+    let alt_sigma = rng.uniform(3.8, 6.2);
+    // 用 AR(1) 缓变地形替换逐点独立噪声：独立噪声几乎不会累积，
+    // 实测 SD 只有 0.2m，等于自报全程无起伏。
+    let alt_terrain = super::altitude::terrain_series(n, alt_sigma, 0.97, &mut rng);
     let mut ten_t = 0.0f64;
     let mut ten_d = 0.0f64;
     let mut ten_st = 0.0f64;
@@ -911,7 +914,11 @@ fn build_from_route_at(
                     rng.gauss(0.0, 1.0),
                 ];
                 let (dx, dy) = jitter.step(sc, z);
-                crate::track::generator::clamp_green_jitter(dx, dy)
+                // 采样间隔越短，允许的抖动越小：dt=1s 的两点各偏 0.6m
+                // 就是 1.2m/s 的伪速度，叠加真实配速会越过瞬移阈值。
+                let limit = crate::track::generator::GREEN_JITTER_CLAMP_M
+                    * (dt / 5.0).clamp(0.3, 1.0);
+                crate::track::generator::clamp_jitter(dx, dy, limit)
             } else {
                 let sc = sdf.sigma_scale([bx, by]);
                 let z = [
@@ -994,13 +1001,17 @@ fn build_from_route_at(
             dist_acc += d_step;
         }
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
-        // 生物力学联动：v=(cad/60)·stride
-        let v_now = speeds[i];
-        let mut stride = v_now * 60.0 / cadences[i];
-        stride = stride.clamp(0.5, 1.7);
-        let cad = v_now * 60.0 / stride;
-        steps_acc += cad / 60.0 * dt;
+        alt = 82.0 + alt_terrain[i];
+        // 生物力学联动：v=(cad/60)·stride。
+        // 关键：步数按**计入距离的位移**折算（异常点不记步），
+        // 否则步数密度会超过 1（2026-10 被判记录是 1.09/1.23/1.33）。
+        // 步频由**逐点速度**反解（v=(cad/60)·stride），步数 = dt·cad/60。
+        // 这样 Σ步数×步幅 恒等于累计距离，步数密度不会漂移；
+        // 而恒定步频正是 2026-10 被判「运动数据有问题」的特征。
+        let cad = super::altitude::cadence_target(speeds[i], dist_acc / 1000.0);
+        if typ != -1 {
+            steps_acc += cad / 60.0 * dt;
+        }
         let nxt = pos(s + 2.0);
         let brg =
             ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
@@ -1145,16 +1156,32 @@ fn build_from_route_at(
         }
         if let Some(i) = best_i {
             if best_d < 40.0 * 40.0 {
+                // 吸附必须夹在「相邻点位移速度」之内：整帧甩到点位上最多 40m，
+                // 5s 采样就是 8m/s 的伪速度（服务端按瞬移处理）。
+                // 这里把位移限制在 max(1.5m, 3·采样间隔) 米内，多余的留给
+                // 前后相邻点分摊，地图上仍能看到轨迹贴着打卡点。
+                let dt = if i > 0 {
+                    (locs[i].totalTime - locs[i - 1].totalTime).max(1) as f64
+                } else {
+                    5.0
+                };
+                let limit = (dt * 0.6).clamp(0.3, 3.0);
+                let cur = (locs[i].gLat, locs[i].gLng);
+                let dy = (pl.0 - cur.0) * MET_PER_DEG_LAT;
+                let dx = (pl.1 - cur.1) * MET_PER_DEG_LNG;
+                let dist_m = (dx * dx + dy * dy).sqrt();
+                let k = if dist_m > limit { limit / dist_m } else { 1.0 };
+                let target = (cur.0 + dy * k / MET_PER_DEG_LAT, cur.1 + dx * k / MET_PER_DEG_LNG);
                 if color_mode == TrackColorMode::FullGreen {
                     let (jx, jy) = crate::track::generator::clamp_green_jitter(
                         jitter_m[i].0,
                         jitter_m[i].1,
                     );
-                    locs[i].gLat = round_to(pl.0 + jy / MET_PER_DEG_LAT, 7);
-                    locs[i].gLng = round_to(pl.1 + jx / MET_PER_DEG_LNG, 7);
+                    locs[i].gLat = round_to(target.0 + jy / MET_PER_DEG_LAT, 7);
+                    locs[i].gLng = round_to(target.1 + jx / MET_PER_DEG_LNG, 7);
                 } else {
-                    locs[i].gLat = round_to(pl.0, 7);
-                    locs[i].gLng = round_to(pl.1, 7);
+                    locs[i].gLat = round_to(target.0, 7);
+                    locs[i].gLng = round_to(target.1, 7);
                 }
             }
         }
@@ -1379,13 +1406,16 @@ mod real_data_alignment_tests {
     #[test]
     #[ignore = "依赖本机真实 OSM 文件；用 cargo test ... -- --ignored 启用"]
     fn loaded_network_overlaps_checkpoints() {
-        let path = r"C:\Users\liming\Downloads\map (4).osm";
+        // 需要真实 OSM 文件时才跑；路径由环境变量提供，不把个人目录写进仓库。
+        let Ok(path) = std::env::var("NEKO_TEST_OSM") else {
+            return;
+        };
         assert!(
-            std::path::Path::new(path).exists(),
-            "本测试需要真实 OSM 文件：{path}"
+            std::path::Path::new(&path).exists(),
+            "NEKO_TEST_OSM 指向的文件不存在：{path}"
         );
-        let net = super::load_network_path(path).expect("加载路网");
-        // 用户实际打卡点（BD-09）
+        let net = super::load_network_path(&path).expect("加载路网");
+        // 测试用打卡点（合成坐标，不代表任何真实学校位置）
         let pts = [
             (39.900000, 116.400000),
             (39.900361, 116.400867),
@@ -1676,9 +1706,12 @@ mod lap_offset_measure {
 
     #[test]
     fn measure_real_lap_offsets() {
-        let path = r"C:\Users\liming\Downloads\map (4).osm";
-        if !std::path::Path::new(path).exists() { return; }
-        let net = super::load_network_path(path).unwrap();
+        // 需要真实 OSM 文件时才跑；路径由环境变量提供，不把个人目录写进仓库。
+        let Ok(path) = std::env::var("NEKO_TEST_OSM") else {
+            return;
+        };
+        if !std::path::Path::new(&path).exists() { return; }
+        let net = super::load_network_path(&path).unwrap();
         let pts = [(39.900000,116.400000),(39.900361,116.400867),(39.900804,116.400611),(39.899480,116.400278),(39.899815,116.400997)];
         let must: Vec<(f64,f64)> = pts[1..].to_vec();
         let tr = super::build_road_mode(2000.0,720,42,1_700_000_000_000,&pts,&must,&net,crate::api::model::TrackColorMode::FullGreen,true).unwrap();

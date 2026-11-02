@@ -137,6 +137,13 @@ fn fetch_release(
     let Some(asset) = pick_asset(&v, want) else {
         return Ok(None);
     };
+    // tag 不是 v* 时（历史 Release 用了 "Release" 这种名字），版本号只能从
+    // Release 标题里取：标题形如 "sportssimulation 0.5.0"，取末段数字。
+    let tag = if split_rev(&tag).0.iter().any(|n| *n > 0) {
+        tag
+    } else {
+        resolve_tag_from_title(&v, &tag)
+    };
     log(&format!(
         "[update] {repo} 最新 {tag}，匹配资产 {}",
         asset.name
@@ -167,6 +174,11 @@ struct AssetPick {
 }
 
 /// 资产匹配：桌面产物要求名字完全一致；APK 先精确后模糊（兼容历史命名）。
+///
+/// Windows 额外接受**裸 exe**：历史 Release 直接传了 `sportssimulation.exe`
+/// 而没有打包成 `Sports-simulation-win-x64.zip`，精确匹配失败会让「检查更新」
+/// 直接报「更新源没有可用的发布资产」。裸 exe 走单独的解包分支（见
+/// [`crate::update::stage_update`]）。
 fn pick_asset(v: &serde_json::Value, want: &str) -> Option<AssetPick> {
     let assets = v.get("assets")?.as_array()?;
     let find = |pred: &dyn Fn(&str) -> bool| -> Option<AssetPick> {
@@ -187,8 +199,39 @@ fn pick_asset(v: &serde_json::Value, want: &str) -> Option<AssetPick> {
             .or_else(|| find(&|n| n.ends_with(".apk") && n.contains("arm64")))
             .or_else(|| find(&|n| n.ends_with(".apk")))
     } else {
-        find(&|n| n == want)
+        find(&|n| n == want).or_else(|| {
+            // Windows 兜底：直接发布的裸 exe（历史 Release 的实际形态）。
+            #[cfg(target_os = "windows")]
+            {
+                find(&|n| {
+                    let l = n.to_ascii_lowercase();
+                    l.ends_with(".exe") && l.contains("sportssimulation")
+                })
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                None
+            }
+        })
     }
+}
+
+
+/// tag 不含版本号时，从 Release 标题里解析 "x.y.z" 回退。
+///
+/// 历史上的 Release 用了 `tag_name = "Release"`、`name = "sportssimulation 0.5.0"`，
+/// 直接按 tag 比较会得到 [0,0,0]，永远判定“没有新版本”。
+fn resolve_tag_from_title(v: &serde_json::Value, fallback: &str) -> String {
+    let title = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+    for token in title.split(|c: char| !(c.is_ascii_digit() || c == '.')) {
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() >= 2
+            && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        {
+            return token.to_string();
+        }
+    }
+    fallback.to_string()
 }
 
 /// 版本比较：剥 v 前缀按点分段数字比较；主版本相同时 -android.N 后缀大的更新。
@@ -253,6 +296,14 @@ pub fn extract(asset_name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
         extract_tar_gz(bytes)
     } else if asset_name.ends_with(".apk") {
         Ok(bytes.to_vec())
+    } else if asset_name.to_ascii_lowercase().ends_with(".exe") {
+        // 裸 exe（历史 Release 直接上传了程序本体，没有打 zip）。
+        // 先确认确实是 PE 可执行文件，避免把 HTML 错误页当成程序写盘。
+        if bytes.len() >= 2 && &bytes[..2] == b"MZ" {
+            Ok(bytes.to_vec())
+        } else {
+            Err("发布资产不是有效的 exe（缺少 MZ 头）".into())
+        }
     } else {
         Err(format!("不支持的发布包格式：{asset_name}"))
     }
@@ -390,6 +441,57 @@ mod tests {
         // 位数不同 / 前后空格
         assert!(is_newer("0.2", "v0.2.1"));
         assert!(!is_newer(" 0.2.5 ", "v0.2.5"));
+    }
+
+    #[test]
+    fn version_falls_back_to_release_title_when_tag_has_no_number() {
+        // 历史 Release：tag="Release"，标题里带版本号。
+        let v = serde_json::json!({"tag_name": "Release", "name": "sportssimulation 0.5.1"});
+        assert_eq!(resolve_tag_from_title(&v, "Release"), "0.5.1");
+        // 标题里没有版本号时保留原 tag，不伪造版本。
+        let bad = serde_json::json!({"tag_name": "Release", "name": "sportssimulation"});
+        assert_eq!(resolve_tag_from_title(&bad, "Release"), "Release");
+        // 正常 v* tag 不应被标题覆盖（调用方已先判断）。
+        let good = serde_json::json!({"tag_name": "v0.5.1", "name": "sportssimulation 9.9.9"});
+        assert_eq!(resolve_tag_from_title(&good, "v0.5.1"), "9.9.9");
+    }
+
+    #[test]
+    fn bare_exe_asset_is_accepted_on_windows() {
+        let v = serde_json::json!({
+            "assets": [
+                {"name": "Sports-simulation-android-arm64.apk", "browser_download_url": "u1", "size": 10},
+                {"name": "sportssimulation.exe", "browser_download_url": "u2", "size": 20}
+            ]
+        });
+        let picked = pick_asset(&v, "Sports-simulation-win-x64.zip");
+        #[cfg(target_os = "windows")]
+        {
+            let p = picked.expect("Windows 应接受裸 exe 兜底");
+            assert_eq!(p.name, "sportssimulation.exe");
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(picked.is_none(), "其他平台不应对 .exe 兜底");
+        }
+    }
+
+    #[test]
+    fn exact_zip_name_still_wins_over_bare_exe() {
+        let v = serde_json::json!({
+            "assets": [
+                {"name": "sportssimulation.exe", "browser_download_url": "u2", "size": 20},
+                {"name": "Sports-simulation-win-x64.zip", "browser_download_url": "u1", "size": 10}
+            ]
+        });
+        let p = pick_asset(&v, "Sports-simulation-win-x64.zip").unwrap();
+        assert_eq!(p.name, "Sports-simulation-win-x64.zip");
+    }
+
+    #[test]
+    fn bare_exe_payload_requires_mz_header() {
+        assert_eq!(extract("sportssimulation.exe", b"MZfake-binary").unwrap(), b"MZfake-binary");
+        assert!(extract("sportssimulation.exe", b"<html>").is_err());
     }
 
     #[test]

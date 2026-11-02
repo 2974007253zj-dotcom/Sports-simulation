@@ -13,7 +13,7 @@ use crate::track::generate_road::RouteMode;
 use crate::track::generator::build_with_color_mode as gen_track;
 use crate::track::wire::{
     build_obs_object, build_obs_object_with_area, five_point_wrapper, five_point_wrapper_with_area,
-    obs_keys, validate_five_point_wrapper,
+    obs_keys, validate_five_point_wrapper, REQUIRED_FIXED_COUNT, REQUIRED_FREE_COUNT,
 };
 use rand_distr::{Distribution, Normal};
 use serde_json::{json, Value};
@@ -64,6 +64,8 @@ pub struct DryRunSummary {
     pub start_longitude: f64,
     pub min_speed_mps: f64,
     pub max_speed_mps: f64,
+    /// 风控自检附带提示（不阻断）。
+    pub preflight_notes: Vec<String>,
 }
 
 fn dry_run_points(anchor: Coordinate) -> Vec<Value> {
@@ -142,6 +144,8 @@ pub fn run_dry_run(params: &RunParams, anchor: Coordinate) -> Result<DryRunSumma
         crate::track::altitude::override_bd_a(&mut track, altitude_m)?;
     }
     track.validate_consistency()?;
+    // dry-run 也要跑风控自检：本地能发现的问题不该等到提交后被服务端判。
+    let report = crate::track::preflight::enforce(&track)?;
 
     let five = five_point_wrapper(&live_points, track.startTime);
     validate_five_point_wrapper(&five)?;
@@ -206,6 +210,7 @@ pub fn run_dry_run(params: &RunParams, anchor: Coordinate) -> Result<DryRunSumma
         start_longitude: track.startLongitude,
         min_speed_mps,
         max_speed_mps,
+        preflight_notes: report.notes,
     })
 }
 
@@ -347,9 +352,24 @@ pub fn run_full_flow_controlled(
     // ③ 轨迹生成（真实道路模式：必经点 + 随机普通点，全部强经过）
     control.check()?;
     let pts_bd = points::points_bd(&pts);
-    // 硬点 = 必经点(isFixed!=0，含策略 must_points) + 随机 ordinary_pick 个普通点；
-    // 按质心角排成自然环序，waypoints[0] 即起点，其余作为强制必经点强经过。
-    let mut fixed = points::points_fixed(&pts);
+    // 硬点 = 必经点 + 随机 ordinary_pick 个普通点；按质心角排成自然环序，
+    // waypoints[0] 即起点，其余作为强制必经点强经过。
+    //
+    // 「哪些是必经点」必须和五点上报共用 `wire::fixed_flags` 的判定：
+    // 学校要求 2 必经 + 3 普通，而点位接口通常只标 1 个必经点，需要补齐。
+    // 若这里仍按接口原值取，就会出现"上报说某点是必经点、轨迹却没经过"。
+    let flags = crate::track::wire::fixed_flags(&pts);
+    let mut fixed: Vec<(f64, f64)> = pts
+        .iter()
+        .zip(&flags)
+        .filter(|(_, &f)| f != 0)
+        .filter_map(|(p, _)| {
+            Some((
+                p.get("lat")?.as_f64()?,
+                p.get("lon")?.as_f64()?,
+            ))
+        })
+        .collect();
     for &mp in &pol.must_points {
         if !fixed
             .iter()
@@ -358,7 +378,12 @@ pub fn run_full_flow_controlled(
             fixed.push(mp);
         }
     }
-    let ordinary = points::points_free(&pts);
+    let ordinary: Vec<(f64, f64)> = pts
+        .iter()
+        .zip(&flags)
+        .filter(|(_, &f)| f == 0)
+        .filter_map(|(p, _)| Some((p.get("lat")?.as_f64()?, p.get("lon")?.as_f64()?)))
+        .collect();
     let mut route_pts =
         crate::track::generate_road::select_route_points(&fixed, &ordinary, params.seed, params.ordinary_pick);
     if route_pts.is_empty() {
@@ -383,7 +408,12 @@ pub fn run_full_flow_controlled(
     }
     // 提交/OBS 只报实际经过的硬点（Road 模式），避免地图出现不在轨迹上的普通点；
     // Legacy 走全部点位，保持原行为。
-    let submitted_pts: Vec<Value> = if params.route_mode == RouteMode::Road {
+    //
+    // 注意：五点上报要求「2 必经 + 3 普通」共 5 个点，Road 模式若只保留被硬点
+    // 选中的子集，会导致点数不足、普通点数不够。因此学校要求 5 点时
+    // 直接沿用全部点位（它们都在轨迹覆盖范围内，见 route_pts）。
+    let keep_all_points = pts.len() <= REQUIRED_FIXED_COUNT + REQUIRED_FREE_COUNT;
+    let submitted_pts: Vec<Value> = if params.route_mode == RouteMode::Road && !keep_all_points {
         let sel: Vec<Value> = pts
             .iter()
             .filter(|p| {
@@ -982,8 +1012,22 @@ pub fn run_records(
     log: &mut dyn FnMut(&str),
 ) -> Result<Vec<super::records::RecordRow>, String> {
     log("[records] 拉取跑步记录…");
-    let rows = super::records::fetch_records(client)?;
-    log(&format!("√ [records] {} 条记录", rows.len()));
+    // 默认接口只回 10 条，记录页要看一学期（6 个月），所以一次取 100 条。
+    // 拉不到 100 条时退回默认页大小，保证老服务端也能用。
+    let rows = match super::records::fetch_records_page(client, 100) {
+        Ok(rows) if !rows.is_empty() => rows,
+        _ => super::records::fetch_records(client)?,
+    };
+    let flagged = rows.iter().filter(|r| r.is_flagged()).count();
+    log(&format!(
+        "√ [records] {} 条记录{}",
+        rows.len(),
+        if flagged > 0 {
+            format!("，其中 {flagged} 条被服务端标记")
+        } else {
+            String::new()
+        }
+    ));
     // 顺带对账未决提交（只读）：用户刷新记录列表时自然就能确认上次结果。
     reconcile_pending(&*client, &rows, log);
     Ok(rows)

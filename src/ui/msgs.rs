@@ -253,7 +253,16 @@ impl App {
             self.records_busy = false;
             match serde_json::from_str::<Vec<crate::api::records::RecordRow>>(&v) {
                 Ok(rows) => {
-                    self.status = format!("已刷新 {} 条记录", rows.len());
+                    let flagged = rows.iter().filter(|r| r.is_flagged()).count();
+                    self.status = if flagged > 0 {
+                        format!(
+                            "已刷新 {} 条记录，其中 {flagged} 条被服务端标记",
+                            rows.len()
+                        )
+                    } else {
+                        format!("已刷新 {} 条记录", rows.len())
+                    };
+                    self.records_page.flagged = flagged;
                     self.records_page.rows = rows;
                 }
                 Err(_) => self.status = "记录数据解析失败".into(),

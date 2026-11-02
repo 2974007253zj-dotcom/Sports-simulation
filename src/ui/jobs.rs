@@ -27,7 +27,9 @@ impl App {
         self.update.checking = true;
         self.update.check_error = None;
         if manual {
-            self.tab = 8;
+            // 跳「关于」页（检查结果和下载按钮都在那里）。这里必须用常量：
+            // 曾经写死 8，而 8 是「配置档位」，用户点检查更新会莫名其妙跳走。
+            self.tab = super::mobile::TAB_ABOUT;
             self.status = "正在检查更新…".into();
         }
         self.spawn_job(move |tx| {

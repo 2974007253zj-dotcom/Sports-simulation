@@ -24,11 +24,45 @@ pub struct RecordRow {
     pub total_steps: i64,
     #[serde(default)]
     pub uuid: String,
+    /// 服务端状态：0=正常，1/2=被标记（2 为已定案）。
+    #[serde(default)]
+    pub status: i64,
+    /// 申诉状态：0=无，1=可申诉，4=申诉未通过。
+    #[serde(default)]
+    pub appeal_status: i64,
+}
+
+impl RecordRow {
+    /// 是否被服务端判为可疑（`status=1` 待审 / `status=2` 已定案）。
+    pub fn is_flagged(&self) -> bool {
+        self.status == 1 || self.status == 2
+    }
+
+    /// 申诉状态的中文说明；未申诉返回空串。
+    pub fn appeal_note(&self) -> &'static str {
+        match self.appeal_status {
+            1 => "可申诉",
+            2 => "申诉中",
+            3 => "申诉通过",
+            4 => "申诉未通过",
+            _ => "",
+        }
+    }
 }
 
 /// 拉取记录列表并归一化为行。
 pub fn fetch_records(client: &mut ApiClient) -> Result<Vec<RecordRow>, String> {
     let biz = client.call("POST", RECORDS_PATH, "{}", &[])?;
+    Ok(rows_from(records_array(&biz)))
+}
+
+/// 按页大小拉取记录（服务端默认只回 10 条）。
+pub fn fetch_records_page(
+    client: &mut ApiClient,
+    page_size: i64,
+) -> Result<Vec<RecordRow>, String> {
+    let body = json!({ "pageNum": 1, "pageSize": page_size }).to_string();
+    let biz = client.call("POST", RECORDS_PATH, &body, &[])?;
     Ok(rows_from(records_array(&biz)))
 }
 
@@ -61,6 +95,8 @@ fn rows_from(arr: Vec<Value>) -> Vec<RecordRow> {
             avg_power: r.get("avgPower").and_then(|v| v.as_i64()).unwrap_or(0),
             total_steps: r.get("totalSteps").and_then(|v| v.as_i64()).unwrap_or(0),
             uuid: r.get("uuid").and_then(|v| v.as_str()).unwrap_or("").into(),
+            status: r.get("status").and_then(|v| v.as_i64()).unwrap_or(0),
+            appeal_status: r.get("appealStatus").and_then(|v| v.as_i64()).unwrap_or(0),
         })
         .collect()
 }

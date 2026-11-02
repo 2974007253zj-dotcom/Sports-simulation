@@ -30,10 +30,22 @@ pub struct ProfilesPage {
 impl App {
     pub fn draw_profiles(&mut self, ui: &mut egui::Ui) {
         let mut book = ProfileBook::load();
+        // 首次进入本页时补设备身份（升级前所有档位共用全局 identity.json）。
+        let migrated = book.migrate_identities(&self.config.username, &self.identity);
+        if migrated > 0 {
+            if let Err(e) = book.save() {
+                self.profiles_page.status = format!("设备身份迁移保存失败：{e}");
+            } else {
+                self.profiles_page.status = format!(
+                    "已为 {migrated} 个账号档位生成独立设备身份（当前登录账号沿用原设备）"
+                );
+            }
+        }
 
         ui.add_space(4.0);
         ui.label(
-            egui::RichText::new("每个档位保存一组跑步参数，可另绑账号；应用后立即写入 config.json。")
+            egui::RichText::new("每个档位保存一组跑步参数，可另绑账号；应用后立即写入 config.json。
+绑定了账号的档位会单独保存设备身份（DeviceId/MAC/安装时间），切换档位时一起切换。")
                 .small(),
         );
         if !self.profiles_page.status.is_empty() {
@@ -81,6 +93,16 @@ impl App {
                                 .small()
                                 .color(theme::plain()),
                         );
+                        // 设备指纹：每个账号一套，脱敏后只显示前 8 位便于区分。
+                        let device = match &slot.identity {
+                            Some(id) => format!("设备 {}", short_device_id(&id.device_id)),
+                            None => "设备 跟随全局".to_string(),
+                        };
+                        ui.label(
+                            egui::RichText::new(device)
+                                .small()
+                                .color(theme::text_dim()),
+                        );
                         if !active && ui.small_button("应用").clicked() {
                             apply = Some(index);
                         }
@@ -94,7 +116,8 @@ impl App {
                 }
                 if let Some(index) = overwrite {
                     let name = book.slots[index].name.clone();
-                    book.slots[index] = ProfileBook::capture(&name, &self.config);
+                    book.slots[index] =
+                        ProfileBook::capture(&name, &self.config, Some(&self.identity));
                     let _ = book.save();
                     self.profiles_page.status = format!("已用当前配置覆盖「{name}」");
                 }
@@ -162,7 +185,7 @@ impl App {
                     mut_config.password = password;
                     mut_config.remember = remember;
                 }
-                let slot = ProfileBook::capture(&name, &mut_config);
+                let slot = ProfileBook::capture(&name, &mut_config, Some(&self.identity));
                 book.slots.push(slot);
                 let _ = book.save();
                 self.profiles_page.new_name.clear();
@@ -283,11 +306,46 @@ impl App {
         self.profiles_page.status = format!("已导入 {count} 个档位：{names}");
     }
 
+    /// 把当前设备身份写回「激活中的档位」；没有激活档位返回 false。
+    pub(super) fn sync_identity_to_active_slot(&mut self) -> bool {
+        let mut book = ProfileBook::load();
+        let Some(index) = book.active else {
+            return false;
+        };
+        book.store_identity(index, self.identity.clone());
+        book.save().is_ok()
+    }
+
     fn apply_profile(&mut self, book: &mut ProfileBook, index: usize) {
         let slot = book.slots[index].clone();
         let name = slot.name.clone();
         let mut config = self.config.clone();
         ProfileBook::apply_to(&slot, &mut config);
+
+        // 设备身份跟着档位走：每个账号一套独立的 DeviceId / MAC / 安装时间。
+        let mut identity_notice = String::new();
+        match ProfileBook::apply_identity(book, index, &self.identity) {
+            Ok(Some(id)) => {
+                if let Err(e) = crate::api::model::save_identity(&id) {
+                    self.profiles_page.status = format!("保存设备身份失败：{e}");
+                    return;
+                }
+                let changed = id.device_id != self.identity.device_id;
+                self.identity = id.clone();
+                self.device_buf = id.clone();
+                book.store_identity(index, id);
+                identity_notice = if changed {
+                    "，已切换到该账号专属设备身份（请重新登录）".to_string()
+                } else {
+                    "，设备身份已同步".to_string()
+                };
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.profiles_page.status = format!("切换设备身份失败：{e}");
+                return;
+            }
+        }
         if let Err(e) = crate::api::model::save_config(&config) {
             self.profiles_page.status = format!("保存配置失败：{e}");
             return;
@@ -319,12 +377,21 @@ impl App {
         } else {
             "（已切换账号信息，请重新登录）".to_string()
         };
-        self.profiles_page.status = format!("已应用档位「{name}」{re_login}");
+        self.profiles_page.status = format!("已应用档位「{name}」{re_login}{identity_notice}");
     }
 }
 
 fn mask_user(user: &str) -> String {
     crate::textlog::mask(user)
+}
+
+/// 设备 ID 只显示前 8 位，够区分不同档位又不把完整指纹摆在界面上。
+fn short_device_id(id: &str) -> String {
+    if id.len() <= 8 {
+        id.to_string()
+    } else {
+        format!("{}…", &id[..8])
+    }
 }
 
 fn slot_summary(slot: &ProfileSlot) -> String {

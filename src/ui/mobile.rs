@@ -122,19 +122,35 @@ fn balanced_chunks(total: usize, rows: usize) -> Vec<Range<usize>> {
         .collect()
 }
 
+/// 标签页索引常量。跳转到某个页面时必须用这里的常量，不要写死数字：
+/// 原先「检查更新」用 `self.tab = 8`，而 8 是「配置档位」，关于页是 9，
+/// 导致点检查更新会跳到配置档位。
+pub const TAB_RUN: usize = 0;
+pub const TAB_AI: usize = 1;
+pub const TAB_RECORDS: usize = 2;
+pub const TAB_DATA: usize = 3;
+pub const TAB_USER: usize = 4;
+pub const TAB_DEVICE: usize = 5;
+pub const TAB_LOG: usize = 6;
+pub const TAB_OSM: usize = 7;
+pub const TAB_PROFILES: usize = 8;
+pub const TAB_ABOUT: usize = 9;
+
+/// 与 [`tab_bar`] 的标签顺序一致；新增页面时必须同步加常量与文案。
+pub const TABS: [&str; 10] = [
+    "跑步",
+    "AI运动",
+    "运动记录",
+    "数据",
+    "我的",
+    "设备信息",
+    "运行日志",
+    "路网",
+    "配置档位",
+    "关于",
+];
+
 pub fn tab_bar(ui: &mut egui::Ui, selected: &mut usize) -> Vec<egui::Response> {
-    const TABS: [&str; 10] = [
-        "跑步",
-        "AI运动",
-        "运动记录",
-        "数据",
-        "我的",
-        "设备信息",
-        "运行日志",
-        "路网",
-        "配置档位",
-        "关于",
-    ];
     let compact = compact_ui(ui);
     let mut responses = Vec::with_capacity(TABS.len());
     if compact {

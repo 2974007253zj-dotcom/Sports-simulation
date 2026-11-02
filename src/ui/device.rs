@@ -59,7 +59,7 @@ impl App {
                             );
                         }
                         Err(error) => {
-                            self.tab = 5;
+                            self.tab = super::mobile::TAB_DEVICE;
                             self.status = format!("× 保存失败：{error}，请在设备页重新保存");
                         }
                     }
@@ -295,7 +295,14 @@ impl App {
                 match crate::api::model::save_identity(&self.device_buf) {
                     Ok(()) => {
                         self.identity = self.device_buf.clone();
-                        self.status = "√ 设备身份已保存并生效".into();
+                        // 设备页的修改要同步回当前档位，否则切换档位再切回来
+                        // 会把这里刚保存的指纹覆盖掉。
+                        let synced = self.sync_identity_to_active_slot();
+                        self.status = if synced {
+                            "√ 设备身份已保存并生效，已同步到当前档位".into()
+                        } else {
+                            "√ 设备身份已保存并生效".into()
+                        };
                         self.log.push("√  已更新（新设备 ID 从下个请求开始生效）");
                         page.saved_flash = 2.0;
                     }

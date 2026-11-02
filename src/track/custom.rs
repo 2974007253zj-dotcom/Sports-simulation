@@ -202,7 +202,10 @@ pub fn build_custom(
     let mut jy = 0.0f64;
     let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
-    let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
+    let alt_sigma = rng.uniform(3.8, 6.2);
+    // 用 AR(1) 缓变地形替换逐点独立噪声：独立噪声几乎不会累积，
+    // 实测 SD 只有 0.2m，等于自报全程无起伏。
+    let alt_terrain = super::altitude::terrain_series(n, alt_sigma, 0.97, &mut rng);
     let mut ten_t = 0.0f64;
     let mut ten_d = 0.0f64;
     let mut ten_st = 0.0f64;
@@ -290,14 +293,16 @@ pub fn build_custom(
             dist_acc += d_step; // 异常点漂移不计入累计距离
         }
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
-        let v_now = dist / dur_f;
-        let stride_target = 0.62 + 0.17 * v_now
-            + 0.03 * (std::f64::consts::TAU * t_acc / 200.0 + phase_l).sin()
-            + rng.gauss(0.0, 0.008);
-        let v_cad = v_now * (1.0 + 0.03 * (std::f64::consts::TAU * t_acc / 70.0 + phase_l).sin());
-        let cad = (v_cad / stride_target * 60.0).clamp(100.0, 200.0);
-        steps_acc += cad / 60.0 * dt;
+        alt = 82.0 + alt_terrain[i];
+        // 步频跟随**逐点速度**，并只对计入距离的位移记步数，
+        // 保证 Σ步数×步幅 = totalDis（恒步频/步数虚高会被判「运动数据有问题」）。
+        // 步频由**逐点速度**反解（v=(cad/60)·stride），步数 = dt·cad/60。
+        // 这样 Σ步数×步幅 恒等于累计距离，步数密度不会漂移；
+        // 而恒定步频正是 2026-10 被判「运动数据有问题」的特征。
+        let cad = super::altitude::cadence_target(speeds[i], dist_acc / 1000.0);
+        if typ != -1 {
+            steps_acc += cad / 60.0 * dt;
+        }
         let nxt = pos(s + direction * 2.0);
         let brg = ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
         // 异常点（-1）：avgSpeed 为累计均值；GPS 瞬时速度多为低速，偶发漂移尖峰

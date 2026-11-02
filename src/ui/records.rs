@@ -1,9 +1,89 @@
 //! 运动记录页：跑步 / AI 两个分栏，egui_extras 表格。
 
 use super::{mobile, theme, App};
-use chrono::TimeZone;
+use chrono::{NaiveDate, TimeZone};
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
+
+/// 学校学期划分：一年两个学期，按日期落在哪一段就算哪个学期。
+///
+/// * 下学期：2 月 16 日 – 8 月 15 日
+/// * 上学期：8 月 16 日 – 次年 2 月 15 日
+///
+/// 两个区间首尾相接且不重叠，任何日期都有唯一归属。
+pub struct Semester {
+    /// 学期起始日（本地时间 00:00:00）的毫秒时间戳。
+    pub start_ms: i64,
+    /// 学期结束日的**次日** 00:00 的毫秒时间戳（左闭右开）。
+    pub end_ms: i64,
+    /// 学期名称，如「2026-2027 上学期」。
+    pub name: String,
+}
+
+impl Semester {
+    /// 按给定日期算出所属学期。
+    pub fn containing(date: chrono::NaiveDate) -> Self {
+        use chrono::{Datelike, TimeZone};
+        let (y, m, d) = (date.year(), date.month(), date.day());
+        // 2/16–8/15 是同一个自然年内的下学期；8/16 起跨年到次年 2/15。
+        let in_spring = (m == 2 && d >= 16) || (3..=7).contains(&m) || (m == 8 && d <= 15);
+        let (start, end, name) = if in_spring {
+            (
+                NaiveDate::from_ymd_opt(y, 2, 16).unwrap(),
+                // 结束日 8/15，右边界取 8/16
+                NaiveDate::from_ymd_opt(y, 8, 16).unwrap(),
+                format!("{y} 下学期（2/16–8/15）"),
+            )
+        } else {
+            // 8/16 及以后属于 y~y+1 学期；1/1–2/15 属于 y-1~y 学期。
+            let first_year = if m == 1 || (m == 2 && d <= 15) { y - 1 } else { y };
+            (
+                NaiveDate::from_ymd_opt(first_year, 8, 16).unwrap(),
+                NaiveDate::from_ymd_opt(first_year + 1, 2, 16).unwrap(),
+                format!("{first_year}-{} 上学期（8/16–次年2/15）", first_year + 1),
+            )
+        };
+        let start_ms = chrono::Local
+            .from_local_datetime(&start.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(0);
+        let end_ms = chrono::Local
+            .from_local_datetime(&end.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .map(|t| t.timestamp_millis())
+            .unwrap_or(i64::MAX);
+        Self {
+            start_ms,
+            end_ms,
+            name,
+        }
+    }
+
+    /// 今天所属的学期。
+    pub fn current() -> Self {
+        Self::containing(chrono::Local::now().date_naive())
+    }
+}
+
+/// 记录视图只显示**本学期**（范围由 [`Semester::current`] 按日期自动计算）。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecordsWindow {
+    #[default]
+    Semester,
+}
+
+impl RecordsWindow {
+    pub fn label(self) -> &'static str {
+        "本学期"
+    }
+
+    /// 时间范围（左闭右开）。
+    pub fn range_ms(self) -> (i64, i64) {
+        let s = Semester::current();
+        (s.start_ms, s.end_ms)
+    }
+}
 
 #[derive(Default)]
 pub struct RecordsPage {
@@ -11,6 +91,8 @@ pub struct RecordsPage {
     pub ai_groups: Vec<crate::api::ai::AiRecordGroup>,
     pub ai_total: i64,
     pub sub: usize,
+    /// 被服务端标记（status=1/2）的记录数。
+    pub flagged: usize,
     /// 当前展开详情的 rrid
     pub detail_rrid: Option<i64>,
     pub detail_raw: Option<serde_json::Value>,
@@ -38,6 +120,19 @@ impl App {
                     }
                     if self.records_busy {
                         ui.label("拉取中…");
+                    }
+                    ui.separator();
+                    // 只显示本学期，范围后台按日期自动计算，不给切换入口。
+                    ui.label(
+                        egui::RichText::new(Semester::current().name)
+                            .small()
+                            .color(theme::text_dim()),
+                    );
+                    if self.records_page.flagged > 0 {
+                        ui.colored_label(
+                            theme::err(),
+                            format!("{} 条被标记", self.records_page.flagged),
+                        );
                     }
                 }
                 _ => {
@@ -152,6 +247,29 @@ impl App {
             ui.centered_and_justified(|ui| ui.label("暂无跑步记录"));
             return;
         }
+        // 时间范围过滤：默认只看本学期（6 个月）。服务端一次性给 100 条，
+        // 学期外的记录默认收起，但切到「全部」随时能看。
+        // 只保留本学期：[学期开始日 00:00, 结束日次日 00:00)。
+        let sem = Semester::current();
+        let (start, end) = RecordsWindow::Semester.range_ms();
+        let rows: Vec<crate::api::records::RecordRow> = self
+            .records_page
+            .rows
+            .iter()
+            .filter(|r| r.start_time >= start && r.start_time < end)
+            .cloned()
+            .collect();
+        if rows.is_empty() {
+            ui.add_space(20.0);
+            ui.centered_and_justified(|ui| {
+                ui.label(format!("{}内暂无跑步记录", sem.name))
+            });
+            return;
+        }
+        ui.label(
+            egui::RichText::new(format!("{} · {} 条", sem.name, rows.len()))
+                .color(theme::text_dim()),
+        );
         let fmt_time = |ms: i64| -> String {
             chrono::Local
                 .timestamp_millis_opt(ms)
@@ -181,18 +299,23 @@ impl App {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for r in &self.records_page.rows {
+                    for r in &rows {
                         let rrid = r.rrid;
                         let (pace_min, pace_sec) = pace_of(r.total_dis, r.total_time);
                         theme::card_frame().show(ui, |ui| {
                             mobile::row(ui, |ui| {
                                 ui.strong(fmt_time(r.start_time));
-                                if r.complete {
+                                if r.is_flagged() {
+                                    ui.colored_label(theme::err(), if r.status == 2 { "已判违规" } else { "被标记" });
+                                } else if r.complete {
                                     ui.colored_label(theme::ok(), "达标");
                                 } else {
                                     ui.colored_label(theme::err(), "未达标");
                                 }
                             });
+                            if r.is_flagged() && !r.appeal_note().is_empty() {
+                                ui.colored_label(theme::err(), r.appeal_note());
+                            }
                             ui.label(format!(
                                 "{:.2} km · {} · 配速 {pace_min}:{pace_sec:02}/km",
                                 r.total_dis / 1000.0,
@@ -232,7 +355,7 @@ impl App {
             .column(Column::remainder()) // 操作
             .header(22.0, |mut h| {
                 for t in [
-                    "时间", "距离", "时长", "配速", "步频", "达标", "rrid", "操作",
+                    "时间", "距离", "时长", "配速", "步频", "判定", "rrid", "操作",
                 ] {
                     h.col(|ui| {
                         ui.label(egui::RichText::new(t).strong().color(theme::text()));
@@ -241,7 +364,7 @@ impl App {
             })
             .body(|mut body| {
                 let sel = self.records_page.detail_rrid;
-                for r in &self.records_page.rows {
+                for r in &rows {
                     let rrid = r.rrid;
                     let is_detail = sel == Some(rrid);
                     body.row(20.0, |mut row| {
@@ -267,7 +390,12 @@ impl App {
                             ui.monospace(format!("{} spm", r.avg_step_freq));
                         });
                         row.col(|ui| {
-                            if r.complete {
+                            if r.is_flagged() {
+                                ui.colored_label(
+                                    theme::err(),
+                                    if r.status == 2 { "已判违规" } else { "被标记" },
+                                );
+                            } else if r.complete {
                                 ui.colored_label(theme::ok(), "达标");
                             } else {
                                 ui.colored_label(theme::err(), "未达标");
@@ -614,6 +742,14 @@ fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
         }),
         ("地址", g("address")),
         ("状态", g("statusInfo")),
+        ("判定", if i("isCheat") == 1 { "已被系统判为可疑".into() } else { "正常".into() }),
+        ("申诉", match i("appealStatus") {
+            1 => "可申诉".into(),
+            2 => "申诉中".into(),
+            3 => "申诉通过".into(),
+            4 => format!("申诉未通过{}", if g("appealStatusInfo").is_empty() { String::new() } else { format!("（{}）", g("appealStatusInfo")) }),
+            _ => String::new(),
+        }),
     ];
     let st_ms = i("startTime");
     if st_ms > 0 {
@@ -673,6 +809,74 @@ fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
                 }
                 ui.label(reason);
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod semester_tests {
+    use super::Semester;
+    use chrono::NaiveDate;
+
+    fn d(y: i32, m: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, day).unwrap()
+    }
+
+    #[test]
+    fn august_16_starts_the_autumn_semester() {
+        // 8/15 仍属于当年下学期，8/16 起进入跨年上学期——这是唯一的切换点。
+        let a = Semester::containing(d(2026, 8, 15));
+        assert!(a.name.contains("2026 下学期"), "{}", a.name);
+
+        let b = Semester::containing(d(2026, 8, 16));
+        assert!(b.name.contains("2026-2027 上学期"), "{}", b.name);
+    }
+
+    #[test]
+    fn february_16_starts_the_spring_semester() {
+        let a = Semester::containing(d(2027, 2, 15));
+        assert!(a.name.contains("2026-2027 上学期"), "{}", a.name);
+
+        let b = Semester::containing(d(2027, 2, 16));
+        assert!(b.name.contains("2027 下学期"), "{}", b.name);
+    }
+
+    #[test]
+    fn today_2026_11_02_is_in_the_autumn_semester() {
+        let s = Semester::containing(d(2026, 11, 2));
+        assert!(s.name.contains("2026-2027 上学期"), "{}", s.name);
+        // 学期从 2026-08-16 开始，到 2027-02-16 结束（右开）
+        let start = chrono::DateTime::from_timestamp_millis(s.start_ms).unwrap();
+        let end = chrono::DateTime::from_timestamp_millis(s.end_ms).unwrap();
+        let start_local = start.with_timezone(&chrono::Local);
+        let end_local = end.with_timezone(&chrono::Local);
+        assert_eq!(start_local.format("%Y-%m-%d").to_string(), "2026-08-16");
+        assert_eq!(end_local.format("%Y-%m-%d").to_string(), "2027-02-16");
+    }
+
+    #[test]
+    fn january_belongs_to_the_previous_autumn_semester() {
+        let s = Semester::containing(d(2027, 1, 15));
+        assert!(s.name.contains("2026-2027 上学期"), "{}", s.name);
+    }
+
+    #[test]
+    fn every_date_has_exactly_one_semester() {
+        // 全年逐日检查：相邻日期间隔恰为 1 天时不跨学期，跨学期时首尾相接。
+        let mut date = d(2026, 1, 1);
+        for _ in 0..800 {
+            let a = Semester::containing(date);
+            let next = date.succ_opt().unwrap();
+            let b = Semester::containing(next);
+            if a.name == b.name {
+                assert_eq!(a.start_ms, b.start_ms);
+                assert_eq!(a.end_ms, b.end_ms);
+            } else {
+                // 换学期：新学期的开始正好是旧学期的结束
+                assert_eq!(a.end_ms, b.start_ms, "{date} 与 {next} 学期不连续");
+            }
+            assert!(a.start_ms < a.end_ms);
+            date = next;
         }
     }
 }

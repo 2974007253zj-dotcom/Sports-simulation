@@ -281,13 +281,35 @@ impl App {
             let total = plan.sport_ids.len() as i64 * plan.days * plan.per_day;
             let mut ok = 0i64;
             let mut done = 0i64;
+            // 只拉一次记录列表，用来避开与跑步记录重叠的时间段。
+            // 重叠是明确的风控特征：同一账号同一时刻只能有一条运动记录。
+            let busy: Vec<(i64, i64)> = match crate::api::records::fetch_records_page(&mut client, 100) {
+                Ok(rows) => rows
+                    .iter()
+                    .filter(|r| r.start_time > 0 && r.total_time > 0)
+                    .map(|r| (r.start_time, r.start_time + r.total_time * 1000))
+                    .collect(),
+                Err(e) => {
+                    log(&format!("⚠ [ai] 无法拉取记录做重叠检查，已跳过：{e}"));
+                    Vec::new()
+                }
+            };
             for day in 0..plan.days {
                 for _ in 0..plan.per_day {
                     for &sport in &plan.sport_ids {
                         let at = if day == 0 {
                             None
                         } else {
-                            Some(random_time_days_ago(day))
+                            match free_time_days_ago(day, &busy) {
+                                Some(t) => Some(t),
+                                None => {
+                                    done += 1;
+                                    log(&format!(
+                                        "× [ai] {day} 天前无空档（与已有运动记录全部重叠），已跳过（{done}/{total}）"
+                                    ));
+                                    continue;
+                                }
+                            }
                         };
                         done += 1;
                         let tag = if day == 0 {
@@ -373,6 +395,39 @@ fn ai_display(mode: AiMode) -> (&'static str, String, f64, i64, f64) {
             )
         }
     }
+}
+
+/// AI 运动单次时长（毫秒）的保守上界，用于避开重叠。
+const AI_RESERVED_MS: i64 = 30 * 60 * 1000;
+/// 最多重试几次找一个不重叠的时刻。
+const AI_FREE_SLOT_TRIES: usize = 24;
+
+/// days_ago 天前的随机时刻（7:00-21:00），且不与 `busy` 里的任何区间重叠。
+///
+/// 重叠是服务端明确的风控特征（同一账号同一时刻两条记录），所以先试 24 次
+/// 随机时刻，兜底再按小时扫描当天 7:00-21:00。仍无空档时返回 `None`，
+/// 由调用方跳过这次补签——宁可少补一天，也不要制造重叠记录。
+fn free_time_days_ago(days_ago: i64, busy: &[(i64, i64)]) -> Option<i64> {
+    let overlaps = |t: i64| {
+        busy.iter()
+            .any(|&(s, e)| t < e + AI_RESERVED_MS && s < t + AI_RESERVED_MS)
+    };
+    for _ in 0..AI_FREE_SLOT_TRIES {
+        let t = random_time_days_ago(days_ago);
+        if !overlaps(t) {
+            return Some(t);
+        }
+    }
+    // 兜底：按小时扫描当天 7:00-21:00，取第一个空档。
+    let t = random_time_days_ago(days_ago);
+    let day_start = t - (t % 86_400_000);
+    for hour in 7..21 {
+        let cand = day_start + hour * 3_600_000;
+        if !overlaps(cand) {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 /// days_ago 天前的随机时刻（7:00-21:00）。

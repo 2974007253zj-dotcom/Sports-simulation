@@ -266,14 +266,11 @@ fn build_on_ring(
     // 概率跑成顺时针，方向看起来不对。
     let direction: f64 = 1.0;
     let s0 = rng.uniform(0.0, *arcs.last().unwrap_or(&400.0));
-    let phase_l = rng.uniform(0.0, std::f64::consts::TAU);
 
     let (times, dts, w) = speed_profile(dist, dur, &mut rng);
     let n = times.len();
     let seg_dist: Vec<f64> = (0..n).map(|i| w[i] * dts[i]).collect();
     let speeds: Vec<f64> = w.clone();
-    // 步频波动相位（速度剖面内部相位已由 speed_profile 消费）
-    let phase_v = rng.uniform(0.0, std::f64::consts::TAU);
 
     let kinds: Vec<(i64, i64)> = match color_mode {
         TrackColorMode::FullGreen => vec![(0, 1); n],
@@ -324,7 +321,10 @@ fn build_on_ring(
     let mut jy = 0.0f64;
     let mut alt = 82.0 + rng.uniform(-1.0, 1.0);
     let n_est = 1.max((dur_f / 5.0) as i64);
-    let alt_sigma = rng.uniform(3.8, 6.2) / (0.40 * n_est as f64);
+    let alt_sigma = rng.uniform(3.8, 6.2);
+    // 用 AR(1) 缓变地形替换逐点独立噪声：独立噪声几乎不会累积，
+    // 实测 SD 只有 0.2m，等于自报全程无起伏。
+    let alt_terrain = super::altitude::terrain_series(n, alt_sigma, 0.97, &mut rng);
     let mut ten_t = 0.0f64;
     let mut ten_d = 0.0f64;
     let mut ten_st = 0.0f64;
@@ -358,10 +358,20 @@ fn build_on_ring(
                 let jitter_scale = (jitter_limit / GREEN_JITTER_CLAMP_M).max(1.0);
                 jx = 0.72 * jx + rng.gauss(0.0, GREEN_JITTER_SIGMA_CORR * jitter_scale);
                 jy = 0.72 * jy + rng.gauss(0.0, GREEN_JITTER_SIGMA_CORR * jitter_scale);
+                // 抖动上限受采样间隔约束：dt=1s 的两个点如果各自偏移 0.6m，
+                // 就会凭空产生 1.2m/s 的伪速度（叠加真实配速后越过 5m/s 阈值）。
+                // 高斯测量噪声同样按 dt 缩放（真实 GPS 只做时间平均）。
+                // dt_scale 同时约束「相关漂移」和「测量噪声」：只缩噪声不缩
+                // 漂移，AR(1) 状态仍会在两点间跳 4.8m（绕圈模式），1s 间隔
+                // 就变成 5m/s 的伪速度。这里直接按比例收缩整个状态。
+                let dt_scale = (dt / 5.0).clamp(0.15, 1.0);
+                let limit = (jitter_limit * dt_scale).max(0.15);
+                jx *= dt_scale;
+                jy *= dt_scale;
                 let (cx, cy) = clamp_jitter(
-                    jx + rng.gauss(0.0, GREEN_JITTER_SIGMA_MEAS * jitter_scale),
-                    jy + rng.gauss(0.0, GREEN_JITTER_SIGMA_MEAS * jitter_scale),
-                    jitter_limit,
+                    jx + rng.gauss(0.0, GREEN_JITTER_SIGMA_MEAS * jitter_scale * dt_scale),
+                    jy + rng.gauss(0.0, GREEN_JITTER_SIGMA_MEAS * jitter_scale * dt_scale),
+                    limit,
                 );
                 px = bx + cx;
                 py = by + cy;
@@ -437,15 +447,18 @@ fn build_on_ring(
             dist_acc += d_step; // 轨迹点位移计入累计距离
         }
         let (lat, lng) = to_bd(px, py, c_lat, c_lng);
-        alt += 0.04 * (82.0 - alt) + rng.gauss(0.0, alt_sigma);
-        let v_now = dist / dur_f;
-        let stride_target = 0.62
-            + 0.17 * v_now
-            + 0.03 * (std::f64::consts::TAU * t_acc / 200.0 + phase_l).sin()
-            + rng.gauss(0.0, 0.008);
-        let v_cad = v_now * (1.0 + 0.03 * (std::f64::consts::TAU * t_acc / 70.0 + phase_v).sin());
-        let cad = (v_cad / stride_target * 60.0).clamp(100.0, 200.0);
-        steps_acc += cad / 60.0 * dt;
+        alt = 82.0 + alt_terrain[i];
+        // 步频跟着**逐点速度**走（v=(cad/60)·stride），而不是全程平均速度：
+        // 恒定步频是服务端判「运动数据有问题」的典型特征（2026-10 的实际判例）。
+        // 步数按「计入距离的那部分位移」折算（只加 typ != -1 的点），
+        // 保证 Σ步数×步幅 = totalDis，步数密度不会超过 1。
+        // 步频由**逐点速度**反解（v=(cad/60)·stride），步数 = dt·cad/60。
+        // 这样 Σ步数×步幅 恒等于累计距离，步数密度不会漂移；
+        // 而恒定步频正是 2026-10 被判「运动数据有问题」的特征。
+        let cad = super::altitude::cadence_target(speeds[i], dist_acc / 1000.0);
+        if typ != -1 {
+            steps_acc += cad / 60.0 * dt;
+        }
         let nxt = pos(s + direction * 2.0);
         let brg = ((nxt.0 - x).atan2(nxt.1 - y).to_degrees() + rng.gauss(0.0, 35.0)).rem_euclid(360.0);
         // 异常点（-1）：avgSpeed 为累计均值（真人与此一致，不为 0）；

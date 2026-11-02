@@ -15,6 +15,13 @@ use super::model::{GenPoint, Track};
 
 const X_PI: f64 = std::f64::consts::PI * 3000.0 / 180.0;
 
+/// 本学校要求的五点构成：2 个必经点 + 3 个普通点。
+///
+/// 点位接口通常只标 1 个 `isFixed=1`，不足时由 [`five_point_payload`] 补齐。
+/// 「至少通过2个普通点位」这条规则统计的是剩余普通点，因此普通点不能少于 3。
+pub const REQUIRED_FIXED_COUNT: usize = 2;
+pub const REQUIRED_FREE_COUNT: usize = 3;
+
 /// The run-area metadata returned by the point endpoint.
 ///
 /// Older callers can keep using the default value (free-run semantics), while
@@ -98,8 +105,64 @@ pub fn conv_point(p: &GenPoint, start_ms: i64) -> Value {
     })
 }
 
+/// 决定五点里哪些是必经点（`isFixed=1`），返回与 `points` 等长的标志位。
+///
+/// 这是**唯一**的判定来源：轨迹生成（哪些点强经过）与五点上报（`isFixed`）
+/// 必须共用同一份结果，否则会出现"上报说是必经点、轨迹却没经过"的矛盾。
+///
+/// 规则：
+/// * 本学校要求 2 个必经 + 3 个普通（见 [`REQUIRED_FIXED_COUNT`] /
+///   [`REQUIRED_FREE_COUNT`]）；
+/// * 服务端已标的必经点全部保留；
+/// * 不足时按「离首点最远」补齐——跑者绕行必定经过远端，最容易被判定为已通过；
+/// * 服务端标的必经点已经多于要求时保持原值，不降级。
+pub fn fixed_flags(points: &[Value]) -> Vec<i64> {
+    let mut flags: Vec<i64> = points
+        .iter()
+        .map(|p| p.get("isFixed").and_then(|v| v.as_i64()).unwrap_or(0))
+        .collect();
+    let fixed_now = flags.iter().filter(|&&v| v != 0).count();
+    // 普通点至少要留 REQUIRED_FREE_COUNT 个，避免把点全提升成必经点。
+    let max_fixed = points.len().saturating_sub(REQUIRED_FREE_COUNT);
+    let want_fixed = REQUIRED_FIXED_COUNT.min(max_fixed).max(1);
+    if fixed_now < want_fixed {
+        let anchor = points
+            .first()
+            .map(|p| {
+                (
+                    p.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                    p.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                )
+            })
+            .unwrap_or((0.0, 0.0));
+        let mut candidates: Vec<(usize, f64)> = flags
+            .iter()
+            .enumerate()
+            .filter(|(_, &f)| f == 0)
+            .map(|(i, _)| {
+                let p = &points[i];
+                let lat = p.get("lat").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let lon = p.get("lon").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let d = ((lat - anchor.0) * super::geom::MET_PER_DEG_LAT).powi(2)
+                    + ((lon - anchor.1) * super::geom::MET_PER_DEG_LNG).powi(2);
+                (i, d)
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (i, _) in candidates.into_iter().take(want_fixed - fixed_now) {
+            flags[i] = 1;
+        }
+    }
+    flags
+}
+
 /// 五点实体（实时点位 → 跑完态 isPass=true）。
+///
+/// `isFixed` 由 [`fixed_flags`] 统一决定，见该函数的文档。
+/// 服务端规则「至少通过 2 个普通点位」统计的是 `isFixed=0` 的数量，
+/// 因此普通点必须留够——早期版本把五个点全标成 1，导致这条永远为 ✗。
 pub fn five_point_payload(points: &[Value], start_ms: i64) -> Vec<Value> {
+    let flags = fixed_flags(points);
     points
         .iter()
         .enumerate()
@@ -109,10 +172,7 @@ pub fn five_point_payload(points: &[Value], start_ms: i64) -> Vec<Value> {
                 "glat": p["glat"].as_f64().unwrap_or(0.0),
                 "glon": p["glon"].as_f64().unwrap_or(0.0),
                 "id": i as i64 + 1,
-                // 跑完态的 fivePointJson 要把本次命中的打卡点标为固定点。
-                // 点位接口有时只把起点标成 1（其余返回 0），但已验证的
-                // 成功载荷要求所有已通过点均为 isFixed=1。
-                "isFixed": 1,
+                "isFixed": flags[i],
                 "isPass": true,
                 "lat": p["lat"].as_f64().unwrap_or(0.0),
                 "lon": p["lon"].as_f64().unwrap_or(0.0),
@@ -310,7 +370,10 @@ mod validation_tests {
     }
 
     #[test]
-    fn completed_fixed_points_are_marked_fixed_even_if_source_point_is_zero() {
+    fn single_point_is_promoted_to_fixed_when_server_returns_all_zero() {
+        // 只有一个点位且服务端给 0 时，必须提升为必经点，
+        // 否则「经过必经点位」也无法成立。
+        // （多点的情形见 five_point_promotes_one_fixed_when_server_returns_none）
         let points = vec![json!({
             "lat": 39.9,
             "lon": 116.4,
@@ -339,9 +402,101 @@ mod validation_tests {
         crate::track::altitude::override_bd_a(&mut track, 36.75).unwrap();
         let laps = build_laps(&track, track.startTime);
         assert!(!laps.is_empty());
-        assert!(laps.iter().all(|lap| lap["elevationGain"] == 0.0));
-        assert!(laps.iter().all(|lap| lap["endAltAbs"] == 36.75));
-        assert!(laps.iter().all(|lap| lap["endAltRel"] == 0.0));
+        // 单值海拔现在只定**均值**，曲线仍保留地形起伏：每圈都有真实爬升，
+        // 否则服务端会判「运动数据有问题」（totalAscent/elevationGain 全 0）。
+        let gain: f64 = laps
+            .iter()
+            .map(|l| l["elevationGain"].as_f64().unwrap_or(0.0))
+            .sum();
+        assert!(gain > 5.0, "单值海拔下每圈爬升被抹平：{gain}");
+        let ends: Vec<f64> = laps
+            .iter()
+            .map(|l| l["endAltAbs"].as_f64().unwrap_or(0.0))
+            .collect();
+        let mean = ends.iter().sum::<f64>() / ends.len() as f64;
+        assert!(
+            (mean - 36.75).abs() < 12.0,
+            "圈末海拔应围绕 36.75 起伏，实际均值 {mean}"
+        );
+        let rels: Vec<f64> = laps
+            .iter()
+            .map(|l| l["endAltRel"].as_f64().unwrap_or(0.0))
+            .collect();
+        assert!(
+            rels.iter().any(|v| v.abs() > 0.5),
+            "endAltRel 不应全为 0：{rels:?}"
+        );
+    }
+
+    fn pts_with_fixed(fixed_idx: &[usize]) -> Vec<Value> {
+        (0..5)
+            .map(|i| {
+                json!({
+                    "lat": 1.0 + i as f64 * 0.01,
+                    "lon": 2.0 + i as f64 * 0.01,
+                    "glat": 1.0 + i as f64 * 0.01,
+                    "glon": 2.0 + i as f64 * 0.01,
+                    "pointName": format!("P{i}"),
+                    "isFixed": if fixed_idx.contains(&i) { 1 } else { 0 },
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn server_single_fixed_is_topped_up_to_two() {
+        // 点位接口通常只标 1 个 isFixed=1；本学校要求 2 必经 + 3 普通。
+        let pts = pts_with_fixed(&[0]);
+        let flags = fixed_flags(&pts);
+        assert_eq!(flags.iter().filter(|&&f| f == 1).count(), 2, "{flags:?}");
+        assert_eq!(flags.iter().filter(|&&f| f == 0).count(), 3, "{flags:?}");
+        assert_eq!(flags[0], 1, "服务端标的必经点必须保留");
+    }
+
+    #[test]
+    fn topping_up_picks_the_farthest_point() {
+        // 补齐的必经点应取离首点最远的那个（跑者绕行必定经过远端）。
+        let pts = pts_with_fixed(&[0]);
+        let flags = fixed_flags(&pts);
+        assert_eq!(flags[4], 1, "最远点应被提升：{flags:?}");
+    }
+
+    #[test]
+    fn server_two_fixed_are_kept_as_is() {
+        let pts = pts_with_fixed(&[1, 3]);
+        let flags = fixed_flags(&pts);
+        assert_eq!(flags, vec![0, 1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn server_all_zero_gets_two_fixed_and_three_free() {
+        let pts = pts_with_fixed(&[]);
+        let flags = fixed_flags(&pts);
+        assert_eq!(flags.iter().filter(|&&f| f == 1).count(), 2, "{flags:?}");
+        assert_eq!(flags.iter().filter(|&&f| f == 0).count(), 3, "{flags:?}");
+    }
+
+    #[test]
+    fn never_consumes_all_free_points() {
+        // 少于 5 个点时也不能把普通点全吃掉：普通点至少要留 3 个（不足则尽量保留）。
+        let pts: Vec<Value> = (0..3)
+            .map(|i| {
+                json!({"lat": 1.0 + i as f64, "lon": 2.0, "glat": 1.0, "glon": 2.0,
+                       "pointName": "P", "isFixed": 0})
+            })
+            .collect();
+        let flags = fixed_flags(&pts);
+        assert_eq!(flags.iter().filter(|&&f| f == 1).count(), 1, "{flags:?}");
+    }
+
+    #[test]
+    fn five_point_payload_uses_fixed_flags() {
+        let pts = pts_with_fixed(&[0]);
+        let five = five_point_payload(&pts, 1_700_000_000_000);
+        let flags: Vec<i64> = five.iter().map(|p| p["isFixed"].as_i64().unwrap()).collect();
+        assert_eq!(flags.iter().filter(|&&f| f == 1).count(), 2, "{flags:?}");
+        assert_eq!(flags.iter().filter(|&&f| f == 0).count(), 3, "{flags:?}");
+        assert!(five.iter().all(|p| p["isPass"] == true));
     }
 
     #[test]

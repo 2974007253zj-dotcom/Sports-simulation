@@ -107,6 +107,44 @@ pub struct SubmitResult {
     pub sel_distance: i64,
 }
 
+/// 记录列表里任意一条覆盖了 [start, stop) 就当冲突（与服务端记录做跨类型比对）。
+///
+/// 真人在同一时刻只能跑一条：校园跑与户外跑、AI 运动的时间段互斥。本地回执
+/// 保护只覆盖计分跑提交，看不到 AI 运动，也看不到换设备/重装前的记录，
+/// 所以提交前还要和服务端记录列表对一次。
+pub fn check_remote_overlap(
+    rows: &[super::records::RecordRow],
+    start_ms: i64,
+    stop_ms: i64,
+) -> Result<(), String> {
+    for row in rows {
+        if row.start_time <= 0 || row.total_time <= 0 {
+            continue;
+        }
+        let r_start = row.start_time;
+        let r_stop = row.start_time + row.total_time * 1000;
+        if r_start < stop_ms && start_ms < r_stop {
+            return Err(format!(
+                "该时间段与已有记录重叠：rrid={}（{}~{}，{}m）。同一时间只能有一条跑步记录，请更换开始时间",
+                row.rrid,
+                fmt_ms(r_start),
+                fmt_ms(r_stop),
+                row.total_dis.round() as i64
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn fmt_ms(ms: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|t| t.format("%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "?".into())
+}
+
 /// 提交跑步记录（sportType 由调用方指定：1=校园跑，6=户外跑）。
 pub fn submit_record(
     client: &mut ApiClient,
@@ -128,10 +166,30 @@ pub fn submit_record(
     let power = avg_power(p.weight, total_dis, total_time);
     let kcal = official_kcal(p.weight, total_time, total_dis);
 
+    // 风控自检：步数密度 / 海拔起伏 / 坐标瞬移 / 步频-速度相关。
+    // 2026-10 被判的 4 条记录在这四项上全部不合格，提交前拦下比事后申诉划算。
+    let report = crate::track::preflight::enforce(track)?;
+    for note in &report.notes {
+        log(&format!("⚠ [preflight] {note}"));
+    }
+    log("√ [preflight] 轨迹自检通过（步数密度/海拔/瞬移/步频相关）");
+
     // 提交保护：同一账号+学校的独占锁；拿到锁才允许继续。
     // 锁必须先于 UUID 生成取得——落盘回执是这次请求"存在过"的唯一证据。
     let mut guard = Guard::open(p.uid, p.selected_unid)?;
     guard.check(start_ms, stop_ms)?;
+
+    // 跨类型重叠：本地回执只覆盖计分跑，AI 运动要和服务端记录比对。
+    // 拉取失败不阻断提交（宁可漏挡也不让人提交不了），但会写日志。
+    match super::records::fetch_records_page(client, 100) {
+        Ok(rows) => {
+            if let Err(e) = check_remote_overlap(&rows, start_ms, stop_ms) {
+                log(&format!("× [record] {e}"));
+                return Err(e);
+            }
+        }
+        Err(e) => log(&format!("⚠ [record] 无法拉取记录做重叠检查，已跳过：{e}")),
+    }
 
     let run_uuid = uuid::Uuid::new_v4().to_string().to_uppercase();
     let unid = p.selected_unid;
@@ -337,6 +395,56 @@ mod metric_tests {
     #[test]
     fn pace_uses_thousandths_of_minute_per_kilometre() {
         assert_eq!(pace_speed_value(2295, 5030.0), 7604);
+    }
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::check_remote_overlap;
+    use crate::api::records::RecordRow;
+
+    fn row(rrid: i64, start_ms: i64, seconds: i64) -> RecordRow {
+        RecordRow {
+            rrid,
+            total_dis: 1500.0,
+            total_time: seconds,
+            start_time: start_ms,
+            complete: true,
+            avg_step_freq: 130,
+            calorie: 0,
+            avg_power: 0,
+            total_steps: 0,
+            uuid: format!("U{rrid}"),
+            status: 0,
+            appeal_status: 0,
+        }
+    }
+
+    #[test]
+    fn rejects_a_partially_overlapping_record() {
+        // 10-26 的真实事故：AI 记录 11:10-11:25，跑步 11:17-11:29 被判重罚。
+        let base = 1_792_984_000_000i64;
+        let ai = row(1, base, 15 * 60);
+        let run_start = base + 7 * 60 * 1000;
+        let run_stop = run_start + 12 * 60 * 1000;
+        assert!(check_remote_overlap(&[ai], run_start, run_stop).is_err());
+    }
+
+    #[test]
+    fn allows_records_that_only_touch_at_the_boundary() {
+        let base = 1_792_984_000_000i64;
+        let ai = row(1, base, 10 * 60);
+        // 正好从 AI 记录结束时刻开始，不算重叠。
+        assert!(check_remote_overlap(&[ai.clone()], base + 10 * 60 * 1000, base + 20 * 60 * 1000).is_ok());
+        // 正好在 AI 记录开始时刻结束，同样不算。
+        assert!(check_remote_overlap(&[ai], base - 5 * 60 * 1000, base).is_ok());
+    }
+
+    #[test]
+    fn ignores_malformed_rows() {
+        let mut r = row(1, 0, 0);
+        r.start_time = 0;
+        assert!(check_remote_overlap(&[r], 1_000, 2_000).is_ok());
     }
 }
 

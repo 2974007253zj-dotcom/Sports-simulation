@@ -414,6 +414,8 @@ mod tests {
             avg_power: 50,
             total_steps: 1700,
             uuid: uuid.into(),
+            status: 0,
+            appeal_status: 0,
         }
     }
 

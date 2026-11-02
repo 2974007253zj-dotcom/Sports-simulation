@@ -9,6 +9,7 @@ pub mod generator;
 pub mod geom;
 pub mod model;
 pub mod postfix;
+pub mod preflight;
 pub mod stadium;
 /// 十秒窗/圈统计的唯一派生来源。
 pub mod stats;

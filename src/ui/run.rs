@@ -16,6 +16,100 @@ const RAND_HOUR_HI: u32 = 20;
 /// flow.rs 提交时会给开始时间加 0-4s 抖动，随机模式抽样时预留，避免「开始 + 用时」越过当前时刻。
 const JITTER_MARGIN_MS: i64 = 5_000;
 
+/// 「现在时间」模式的允许跑步时段：[9:00, 22:00)。
+///
+/// 开始时间与结束时间都必须落在这个区间内——学校口径的校园跑只在白天到夜间
+/// 开放，超出时段提交会被服务端拒（11016「不在有效跑步时间内」）。
+pub const NOW_MODE_HOUR_LO: u32 = 9;
+pub const NOW_MODE_HOUR_HI: u32 = 22;
+
+/// 「跑完立即提交」模式下，结束时间相对当前时刻的最大滞后（秒）。
+///
+/// 留 0-60s 余量：从点下按钮到服务端收到请求本来就有网络与签名耗时，
+/// 结束时间贴住当前时刻反而更真实；同时保证 `stopTime <= now` 不会被拒。
+const NOW_MODE_TAIL_SECS: i64 = 60;
+
+/// 「现在时间」模式的规划结果。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NowPlan {
+    pub start_ms: i64,
+    pub stop_ms: i64,
+}
+
+/// 按「跑完立即提交」规则计算开始/结束时间。
+///
+/// 语义：现在 = T，跑步用时 = `dur` 秒，则
+/// `开始 ∈ [T-dur-60s, T-dur]`，`结束 = 开始 + dur`，因此结束时间落在
+/// `[T-60s, T]` 内——即"刚跑完就提交"。开始时间在该窗口内随机取一个整秒，
+/// 避免每次都是分秒不差的同一个值。
+///
+/// 两个必须满足的约束，任一不满足返回错误（由调用方直接展示给用户）：
+/// * 结束时间不得晚于当前时刻（服务端拒绝 `stopTime > now`）；
+/// * 开始与结束都必须落在 [`NOW_MODE_HOUR_LO`, `NOW_MODE_HOUR_HI`) 内。
+pub fn plan_now(dur_s: i64, now_ms: i64) -> Result<NowPlan, String> {
+    if dur_s <= 0 {
+        return Err("跑步用时必须是正数".into());
+    }
+    let dur_ms = dur_s * 1000;
+    let now_ts = chrono::DateTime::from_timestamp_millis(now_ms)
+        .ok_or_else(|| "当前时间无效".to_string())?
+        .with_timezone(&Local);
+    let today = now_ts.date_naive();
+    let at = |h: u32| {
+        Local
+            .from_local_datetime(&today.and_hms_opt(h, 0, 0).unwrap_or_default())
+            .single()
+            .map(|t| t.timestamp_millis())
+    };
+    let (window_start, window_end) = match (at(NOW_MODE_HOUR_LO), at(NOW_MODE_HOUR_HI)) {
+        (Some(a), Some(b)) => (a, b),
+        _ => return Err("无法计算可跑时段".into()),
+    };
+
+    // 结束时间的候选窗口：贴近现在（留 0-60s 余量），但必须在窗口内。
+    // 注意不能先把它夹到窗口上界——那样 21:30 跑 40 分钟会被压成
+    // 21:30 结束、20:50 开始，等于悄悄绕过了"超出时段"的错误。
+    let stop_hi = now_ms;
+    let stop_lo = stop_hi - NOW_MODE_TAIL_SECS * 1000;
+
+    // 用「最晚可能的开始时间」判断是否整体越界：只要这个都早于 9:00，
+    // 那么该用时的任何落点都跑不进窗口，直接报错。
+    let earliest_start = stop_lo - dur_ms;
+    if earliest_start < window_start {
+        let start = chrono::DateTime::from_timestamp_millis(earliest_start)
+            .unwrap()
+            .with_timezone(&Local);
+        return Err(format!(
+            "用时 {:.0} 分钟，开始时间最早为 {}，早于 {}:00 开放时刻；请缩短用时或改用其它模式",
+            dur_s as f64 / 60.0,
+            start.format("%H:%M"),
+            NOW_MODE_HOUR_LO
+        ));
+    }
+    // 最晚的结束时间若超过 22:00，说明现在已过可跑时段。
+    if stop_hi > window_end {
+        return Err(format!(
+            "当前时间 {} 已超过 {}:00 可跑时段结束时刻，无法提交",
+            now_ts.format("%H:%M"),
+            NOW_MODE_HOUR_HI
+        ));
+    }
+
+    // 结束时间在 [现在-60s, 现在] 内随机取整秒。
+    let span = ((stop_hi - stop_lo) / 1000).max(0);
+    let stop_ms = stop_lo + rand::random::<i64>().rem_euclid(span + 1) * 1000;
+    let stop_ms = stop_ms.min(stop_hi);
+    let start_ms = stop_ms - dur_ms;
+
+    if start_ms < window_start {
+        return Err(format!("开始时间早于 {}:00，超出可跑时段", NOW_MODE_HOUR_LO));
+    }
+    if stop_ms > now_ms {
+        return Err("结束时间晚于当前时刻，无法提交".into());
+    }
+    Ok(NowPlan { start_ms, stop_ms })
+}
+
 /// 指定日期（days_ago 天前）的 7:00-20:00 内均匀抽样一个时刻，且不晚于 latest_ms。
 ///
 /// latest_ms = 当前时刻 - 用时 - 抖动余量。若该日窗口整体晚于 latest_ms（例如凌晨选「今天」），
@@ -131,6 +225,9 @@ pub struct RunPlan {
     /// 秒
     pub dur: i64,
     pub start_ms: i64,
+    /// 仅「现在时间」模式使用：固定的结束时刻（刚跑完就提交）。
+    /// 其它模式为 `None`，结束时间由 `start_ms + dur` 推出。
+    pub stop_ms: Option<i64>,
     /// 本次方案的随机种子（预览与提交共用，保证所见即所得）
     pub seed: u64,
 }
@@ -151,7 +248,12 @@ impl RunPage {
         if p.start_mode != self.start_mode || p.days_ago != self.days_ago {
             return false;
         }
-        self.start_mode == 0 || (p.hour == self.hour && p.minute == self.minute)
+        // 随机/现在时间模式的时刻是算出来的，只比对模式与日期；
+        // 指定时刻的时/分是用户输入，需回比。
+        match self.start_mode {
+            0 | 2 => true,
+            _ => p.hour == self.hour && p.minute == self.minute,
+        }
     }
 
     /// 开跑时刻上限：当前时刻 - 用时 - 抖动余量（flow.rs 提交时还会再加 0-4s）。
@@ -175,12 +277,31 @@ impl RunPage {
         (dist, pace, dur)
     }
 
-    /// 按当前模式与日期取一个开始时刻（随机模式抽样，指定模式采纳输入框）。
-    fn pick_time(&self) -> i64 {
-        if self.start_mode == 0 {
-            random_time_ago(self.days_ago, Self::latest_start_ms(self.dur_hint()))
-        } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+    /// 按当前模式取一个开始时刻，并给出该模式规定的结束时刻。
+    ///
+    /// | 模式 | 开始 | 结束 |
+    /// |------|------|------|
+    /// | 随机时刻 | 7:00-20:00 内抽样 | 开始 + 用时 |
+    /// | 指定时刻 | 用户填写的时/分 | 开始 + 用时 |
+    /// | 现在时间 | 现在往回推一个用时 | 贴住现在（刚跑完就提交） |
+    fn pick_time(&self) -> (i64, Option<i64>) {
+        match self.start_mode {
+            0 => (
+                random_time_ago(self.days_ago, Self::latest_start_ms(self.dur_hint())),
+                None,
+            ),
+            2 => match plan_now(self.dur_hint(), crate::crypto::envelope::now_ms()) {
+                Ok(p) => (p.start_ms, Some(p.stop_ms)),
+                // 规划失败（超出时段）时把开始时间退到"现在往回推"，由 UI 显示错误。
+                Err(_) => {
+                    let now = crate::crypto::envelope::now_ms();
+                    (now - self.dur_hint() * 1000, Some(now))
+                }
+            },
+            _ => (
+                specified_time(self.days_ago, self.hour, self.minute),
+                None,
+            ),
         }
     }
 
@@ -199,28 +320,41 @@ impl RunPage {
     /// 运动参数变更时重抽距离/配速/用时，保留已选开始时刻（指定模式的时刻是用户输入，不动）。
     fn regen_shape(&mut self) {
         let (dist, pace, dur) = self.sample_shape();
-        let start_ms = match (&self.plan, self.start_mode) {
+        let (start_ms, stop_ms) = match (&self.plan, self.start_mode) {
             // 随机模式沿用已抽样的时刻（仅按新用时收紧上限），避免拖动距离时时刻乱跳
-            (Some(p), 0) => p.start_ms.min(Self::latest_start_ms(dur)),
+            (Some(p), 0) => (p.start_ms.min(Self::latest_start_ms(dur)), None),
             _ => self.pick_time(),
         };
-        self.write_plan(dist, pace, dur, start_ms);
+        self.write_plan_with_stop(dist, pace, dur, start_ms, stop_ms);
     }
 
     /// 只重算开始时刻，保留已抽样的运动量（日期 / 模式变更时用）。
     fn resync_time(&mut self) {
-        let start_ms = self.pick_time();
+        let (start_ms, stop_ms) = self.pick_time();
         if let Some(p) = self.plan.as_mut() {
             p.start_mode = self.start_mode;
             p.days_ago = self.days_ago;
             p.hour = self.hour;
             p.minute = self.minute;
             p.start_ms = start_ms;
+            p.stop_ms = stop_ms;
         }
     }
 
     /// 把当前参数与已算好的量写成方案。
     fn write_plan(&mut self, dist: f64, pace: f32, dur: i64, start_ms: i64) {
+        self.write_plan_with_stop(dist, pace, dur, start_ms, None)
+    }
+
+    /// 同上，但可指定结束时刻（「现在时间」模式用它固定"刚跑完"的落点）。
+    fn write_plan_with_stop(
+        &mut self,
+        dist: f64,
+        pace: f32,
+        dur: i64,
+        start_ms: i64,
+        stop_ms: Option<i64>,
+    ) {
         self.plan = Some(RunPlan {
             dist_min: self.dist_min,
             dist_max: self.dist_max,
@@ -234,6 +368,7 @@ impl RunPage {
             pace,
             dur,
             start_ms,
+            stop_ms,
             seed: rand::random::<u64>(),
         });
         self.preview_stale = true;
@@ -244,12 +379,24 @@ impl RunPage {
     /// 指定模式的时刻由用户填写，按钮不碰它（用户填什么就是什么）。
     pub fn regen_plan(&mut self) {
         let (dist, pace, dur) = self.sample_shape();
-        let start_ms = if self.start_mode == 0 {
-            random_time_ago(self.days_ago, Self::latest_start_ms(dur))
+        // 用新用时重算时刻：「现在时间」模式下还要重算结束落点。
+        let (start_ms, stop_ms) = if self.start_mode == 0 {
+            (
+                random_time_ago(self.days_ago, Self::latest_start_ms(dur)),
+                None,
+            )
+        } else if self.start_mode == 2 {
+            match plan_now(dur, crate::crypto::envelope::now_ms()) {
+                Ok(p) => (p.start_ms, Some(p.stop_ms)),
+                Err(_) => {
+                    let now = crate::crypto::envelope::now_ms();
+                    (now - dur * 1000, Some(now))
+                }
+            }
         } else {
-            specified_time(self.days_ago, self.hour, self.minute)
+            (specified_time(self.days_ago, self.hour, self.minute), None)
         };
-        self.write_plan(dist, pace, dur, start_ms);
+        self.write_plan_with_stop(dist, pace, dur, start_ms, stop_ms);
     }
 
     /// 确保方案与当前参数一致（参数变更补齐 / 提交前兜底）。
@@ -423,17 +570,24 @@ impl App {
                 ui.label("开始时间：");
                 ui.radio_value(&mut page.start_mode, 0, "随机时刻");
                 ui.radio_value(&mut page.start_mode, 1, "指定时刻");
+                ui.radio_value(&mut page.start_mode, 2, "现在时间");
                 ui.label("日期：");
-                egui::ComboBox::from_id_salt("run_days_ago")
-                    .width(96.0)
-                    .selected_text(days_ago_label(page.days_ago))
-                    .show_ui(ui, |ui| {
-                        for d in 0..=3 {
-                            ui.selectable_value(&mut page.days_ago, d, days_ago_label(d));
-                        }
-                    });
+                ui.add_enabled_ui(page.start_mode != 2, |ui| {
+                    egui::ComboBox::from_id_salt("run_days_ago")
+                        .width(96.0)
+                        .selected_text(days_ago_label(page.days_ago))
+                        .show_ui(ui, |ui| {
+                            for d in 0..=3 {
+                                ui.selectable_value(&mut page.days_ago, d, days_ago_label(d));
+                            }
+                        });
+                });
                 if page.start_mode == 0 {
                     ui.label(format!("（{RAND_HOUR_LO}:00-{RAND_HOUR_HI}:00 内随机）"));
+                } else if page.start_mode == 2 {
+                    ui.label(format!(
+                        "（结束时间贴住现在，需在 {NOW_MODE_HOUR_LO}:00-{NOW_MODE_HOUR_HI}:00 内跑完）"
+                    ));
                 } else {
                     ui.label("时刻：");
                     mobile::drag_i64(ui, "run_hour", &mut page.hour, 0..=23, 1.0, "", " 点");
@@ -441,6 +595,30 @@ impl App {
                     mobile::drag_i64(ui, "run_minute", &mut page.minute, 0..=59, 1.0, "", "");
                 }
             });
+            if page.start_mode == 2 {
+                // 「现在时间」模式：立刻试算一次，把时段/用时问题直接展示出来。
+                match plan_now(page.dur_hint(), crate::crypto::envelope::now_ms()) {
+                    Ok(p) => {
+                        let start = chrono::DateTime::from_timestamp_millis(p.start_ms)
+                            .unwrap()
+                            .with_timezone(&Local);
+                        let stop = chrono::DateTime::from_timestamp_millis(p.stop_ms)
+                            .unwrap()
+                            .with_timezone(&Local);
+                        ui.colored_label(
+                            theme::ok(),
+                            format!(
+                                "开始 {} → 结束 {}（跑完即提交）",
+                                start.format("%H:%M:%S"),
+                                stop.format("%H:%M:%S")
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        ui.colored_label(theme::err(), format!("× {e}"));
+                    }
+                }
+            }
             if page.start_mode == 1 && page.days_ago == 0 {
                 // 今天 + 指定时刻：提示是否落在未来
                 let now = Local::now();
@@ -1341,6 +1519,109 @@ fn route_prefix(route: &[(f64, f64)], progress: f32) -> Vec<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_ms(y: i32, m: u32, d: u32, h: u32, mi: u32, se: u32) -> i64 {
+        Local
+            .with_ymd_and_hms(y, m, d, h, mi, se)
+            .single()
+            .unwrap()
+            .timestamp_millis()
+    }
+
+    fn hm(ms: i64) -> String {
+        chrono::DateTime::from_timestamp_millis(ms)
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%H:%M:%S")
+            .to_string()
+    }
+
+    /// 跑完立即提交：结束时间贴住现在，开始时间 = 结束 - 用时。
+    #[test]
+    fn now_mode_finishes_right_before_submission() {
+        let now = local_ms(2026, 11, 2, 17, 0, 0);
+        let p = plan_now(30 * 60, now).unwrap();
+        // 结束时间落在 [现在-60s, 现在]
+        assert!(p.stop_ms <= now, "结束时间不能晚于现在");
+        assert!(p.stop_ms >= now - 60_000, "结束时间应贴近现在，实际 {}", hm(p.stop_ms));
+        // 用时精确 30 分钟
+        assert_eq!(p.stop_ms - p.start_ms, 30 * 60 * 1000);
+        // 开始时间 ≈ 16:25-16:30
+        let start = hm(p.start_ms);
+        assert!(start >= "16:24:00".to_string() && start <= "16:30:00".to_string(), "开始={start}");
+    }
+
+    /// 21:30 跑 40 分钟：开始 20:50、结束 21:30，全程在窗口内 → 允许。
+    #[test]
+    fn now_mode_allows_late_run_that_still_fits_the_window() {
+        let now = local_ms(2026, 11, 2, 21, 30, 0);
+        let p = plan_now(40 * 60, now).unwrap();
+        assert!(p.start_ms >= local_ms(2026, 11, 2, 9, 0, 0));
+        assert!(p.stop_ms <= local_ms(2026, 11, 2, 22, 0, 0));
+        assert!(p.stop_ms <= now);
+    }
+
+    /// 已过 22:00 还提交，必须报错（不能把结束时间挪回 22:00 蒙混过去）。
+    #[test]
+    fn now_mode_rejects_submission_after_closing_time() {
+        let now = local_ms(2026, 11, 2, 22, 30, 0);
+        let err = plan_now(20 * 60, now).unwrap_err();
+        assert!(err.contains("22"), "{err}");
+    }
+
+    /// 22:00 后跑，即使用时很短也要拒绝。
+    #[test]
+    fn now_mode_rejects_short_run_after_22() {
+        let now = local_ms(2026, 11, 2, 23, 0, 0);
+        assert!(plan_now(5 * 60, now).is_err());
+    }
+
+    /// 开始时间早于 9:00 也要报错。
+    #[test]
+    fn now_mode_rejects_runs_that_start_before_9() {
+        let now = local_ms(2026, 11, 2, 9, 20, 0);
+        let err = plan_now(40 * 60, now).unwrap_err();
+        assert!(err.contains("9") || err.contains("可跑时段"), "{err}");
+    }
+
+    /// 9:30 跑 30 分钟：最早开始 08:59，早于 9:00 → 报错。
+    #[test]
+    fn now_mode_rejects_run_starting_before_nine() {
+        let now = local_ms(2026, 11, 2, 9, 30, 0);
+        let err = plan_now(30 * 60, now).unwrap_err();
+        assert!(err.contains("9:00") || err.contains("早于"), "{err}");
+    }
+
+    /// 9:31 跑 30 分钟：最早开始 09:00，刚好够 → 允许。
+    #[test]
+    fn now_mode_accepts_run_that_exactly_fits_from_nine() {
+        let now = local_ms(2026, 11, 2, 9, 31, 0);
+        let p = plan_now(30 * 60, now).unwrap();
+        assert!(p.start_ms >= local_ms(2026, 11, 2, 9, 0, 0), "开始 {}", hm(p.start_ms));
+        assert!(p.stop_ms <= now);
+    }
+
+    /// 白天任取多个时刻，结果都必须落在 9:00-22:00 区间内。
+    #[test]
+    fn now_mode_always_stays_inside_the_window() {
+        for hour in 9..22u32 {
+            for minute in [0u32, 15, 30, 45] {
+                let now = local_ms(2026, 11, 2, hour, minute, 0);
+                let dur = 25 * 60;
+                match plan_now(dur, now) {
+                    Ok(p) => {
+                        assert!(p.start_ms >= local_ms(2026, 11, 2, 9, 0, 0), "{hour}:{minute} 开始太早");
+                        assert!(p.stop_ms <= local_ms(2026, 11, 2, 22, 0, 0), "{hour}:{minute} 结束太晚");
+                        assert!(p.stop_ms <= now, "{hour}:{minute} 结束晚于现在");
+                    }
+                    Err(_) => {
+                        // 只有在用时跨越 9:00 下界时才允许失败
+                        assert!(hour == 9 && minute < 25, "{hour}:{minute} 不应失败");
+                    }
+                }
+            }
+        }
+    }
 
     /// 滑块截取：0% 只有一个点，100% 是完整路线，中途按弧长均匀截断。
     #[test]
