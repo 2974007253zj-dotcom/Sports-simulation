@@ -75,7 +75,7 @@ pub(crate) fn safe_insets() -> [i32; 4] {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_nekosportsworld_tool_MainActivity_nativeSetInsets(
+pub extern "system" fn Java_org_sportssimulation_tool_MainActivity_nativeSetInsets(
     _env: JNIEnv<'_>,
     _activity: JObject<'_>,
     left: i32,
@@ -170,7 +170,7 @@ pub(crate) fn complete_device_info() {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_nekosportsworld_tool_MainActivity_nativeDeviceInfo(
+pub extern "system" fn Java_org_sportssimulation_tool_MainActivity_nativeDeviceInfo(
     mut env: JNIEnv<'_>,
     _activity: JObject<'_>,
     initial: jni::sys::jboolean,
@@ -286,7 +286,7 @@ pub(crate) fn set_keep_screen_on(enabled: bool) {
 }
 
 #[no_mangle]
-pub extern "system" fn Java_org_nekosportsworld_tool_MainActivity_nativeSubmitEdit(
+pub extern "system" fn Java_org_sportssimulation_tool_MainActivity_nativeSubmitEdit(
     mut env: JNIEnv<'_>,
     _activity: JObject<'_>,
     id: jlong,

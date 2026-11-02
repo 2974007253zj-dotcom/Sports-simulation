@@ -58,3 +58,6 @@ docs/_preview.png
 
 # 发布打包产物
 /dist/
+
+# 本地 APK 打包中间产物
+/android/local-package/
