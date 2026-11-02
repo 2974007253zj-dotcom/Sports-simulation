@@ -210,8 +210,10 @@ jobs:
           name: Sports-simulation-android-arm64
           path: dist/*
 
-      - name: 发布到 Release（仅上游 tag push）
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'liing6666/Sports-simulation' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+      # 本仓库只发布源码，不提供预编译 APK（见 README 免责声明）。
+      # APK 仅作为 Actions artifact 保留，不附加到 Release。
+      # - name: 发布到 Release（仅上游 tag push）
+      #   if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'liing6666/Sports-simulation' }}
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     files: dist/*

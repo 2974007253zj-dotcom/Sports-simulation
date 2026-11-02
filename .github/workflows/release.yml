@@ -101,8 +101,11 @@ jobs:
           name: ${{ matrix.artifact }}
           path: dist/*
 
-      - name: Release (upstream tag push only)
-        if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'liing6666/Sports-simulation' }}
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
+      # 本仓库只发布源码，不提供预编译产物（见 README 免责声明）。
+      # 构建产物仅作为 Actions artifact 保留，不附加到 Release。
+      # 如需恢复发布，把下面这一步改回 softprops/action-gh-release 并解除注释。
+      # - name: Release (upstream tag push only)
+      #   if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.repository == 'liing6666/Sports-simulation' }}
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     files: dist/*
