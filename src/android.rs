@@ -22,6 +22,12 @@ static CONTEXT: Mutex<Option<egui::Context>> = Mutex::new(None);
 static EDITS: OnceLock<Mutex<HashMap<u64, String>>> = OnceLock::new();
 static SCREEN_ON: AtomicBool = AtomicBool::new(false);
 static SAFE_INSETS: Mutex<[i32; 4]> = Mutex::new([0; 4]);
+
+/// 屏幕密度（dp → 物理像素）。0 表示尚未从 Java 侧获取。
+///
+/// egui 默认 `pixels_per_point = 1.0`，会把 1080px 宽的屏幕当成 1080 逻辑像素，
+/// 于是永远进不了 compact 布局分支（阈值 620），界面按桌面版排版而错乱。
+static SCREEN_DENSITY: Mutex<f32> = Mutex::new(0.0);
 static DEVICE_INFO: Mutex<Option<DeviceInfoReply>> = Mutex::new(None);
 
 pub(crate) struct DeviceInfoReply {
@@ -72,6 +78,39 @@ pub(crate) fn set_context(context: &egui::Context) {
 
 pub(crate) fn safe_insets() -> [i32; 4] {
     *SAFE_INSETS.lock().unwrap()
+}
+
+/// 屏幕密度；尚未收到时返回 `None`，调用方保持 egui 的默认值。
+pub(crate) fn screen_density() -> Option<f32> {
+    let d = *SCREEN_DENSITY.lock().unwrap();
+    if d > 0.5 {
+        Some(d)
+    } else {
+        None
+    }
+}
+
+/// Java 侧在 `onCreate` 与配置变更后调用，传入 `DisplayMetrics.density`。
+#[no_mangle]
+pub extern "system" fn Java_org_sportssimulation_tool_MainActivity_nativeSetDensity(
+    _env: JNIEnv<'_>,
+    _activity: JObject<'_>,
+    density: f32,
+) {
+    if !density.is_finite() || density <= 0.5 {
+        return;
+    }
+    let d = density.clamp(0.5, 6.0);
+    {
+        let mut cur = SCREEN_DENSITY.lock().unwrap();
+        if (*cur - d).abs() < 1e-3 {
+            return;
+        }
+        *cur = d;
+    }
+    if let Some(context) = CONTEXT.lock().unwrap().as_ref() {
+        context.request_repaint();
+    }
 }
 
 #[no_mangle]
@@ -252,6 +291,115 @@ pub(crate) fn version_name() -> String {
         Ok(text)
     })
     .unwrap_or_default()
+}
+
+/// 文件选择的结果状态。
+///
+/// **必须异步**：SAF 对话框打开时 Activity 会暂停，若在渲染线程里忙等，
+/// 整个界面会冻结并被系统判为 ANR 直接杀掉（实测导入时闪退）。
+#[derive(Clone, Debug, PartialEq)]
+pub enum PickState {
+    /// 尚未开始。
+    Idle,
+    /// 对话框已弹出，等待用户在系统界面里选择。
+    Waiting,
+    /// 已完成。
+    Done(Result<String, String>),
+}
+
+/// 打开系统文件选择器（不阻塞，调用后每帧用 [`poll_pick_read`] 取结果）。
+pub(crate) fn start_pick_read() {
+    CURRENT_PICK.lock().unwrap().replace(PickState::Waiting);
+    let ok = with_activity(|env, activity| {
+        env.call_method(activity, "pickFileForRead", "()V", &[])?;
+        Ok(())
+    });
+    if !ok {
+        CURRENT_PICK
+            .lock()
+            .unwrap()
+            .replace(PickState::Done(Err("无法调用文件选择器".into())));
+    }
+}
+
+/// 打开系统保存对话框（不阻塞）。
+pub(crate) fn start_pick_write(name: &str, text: &str) {
+    CURRENT_PICK.lock().unwrap().replace(PickState::Waiting);
+    let ok = with_activity(|env, activity| {
+        let n = env.new_string(name)?;
+        let t = env.new_string(text)?;
+        env.call_method(
+            activity,
+            "pickFileForWrite",
+            "(Ljava/lang/String;Ljava/lang/String;)V",
+            &[JValue::Object(n.as_ref()), JValue::Object(t.as_ref())],
+        )?;
+        Ok(())
+    });
+    if !ok {
+        CURRENT_PICK
+            .lock()
+            .unwrap()
+            .replace(PickState::Done(Err("无法调用文件保存对话框".into())));
+    }
+}
+
+static CURRENT_PICK: Mutex<Option<PickState>> = Mutex::new(None);
+
+/// 每帧调用；仍在等待时返回 `None`。
+pub(crate) fn poll_pick_read() -> Option<Result<String, String>> {
+    poll_pick("takeReadResult", true)
+}
+
+pub(crate) fn poll_pick_write() -> Option<Result<(), String>> {
+    poll_pick("takeWriteResult", false).map(|r| r.map(|_| ()))
+}
+
+fn poll_pick(method: &str, two_part: bool) -> Option<Result<String, String>> {
+    let state = CURRENT_PICK.lock().unwrap().clone();
+    match state {
+        Some(PickState::Waiting) => {}
+        Some(PickState::Done(r)) => return Some(r),
+        _ => return None,
+    }
+
+    let raw = with_activity_value(|env, activity| {
+        let value = env.call_method(activity, method, "()Ljava/lang/String;", &[])?;
+        let object = value.l()?;
+        if object.is_null() {
+            return Ok(None);
+        }
+        let string: JString = object.into();
+        let text: String = env.get_string(&string)?.into();
+        Ok(Some(text))
+    })
+    .flatten();
+
+    let raw = raw?;
+    let parts: Vec<&str> = raw.split('\u{0}').collect();
+    let result = if two_part {
+        let text = parts.get(1).copied().unwrap_or("");
+        let err = parts.get(2).copied().unwrap_or("");
+        if err.is_empty() {
+            Ok(text.to_string())
+        } else {
+            Err(err.to_string())
+        }
+    } else {
+        let err = parts.get(1).copied().unwrap_or("");
+        if err.is_empty() {
+            Ok(String::new())
+        } else {
+            Err(err.to_string())
+        }
+    };
+    *CURRENT_PICK.lock().unwrap() = Some(PickState::Done(result.clone()));
+    Some(result)
+}
+
+/// 放弃当前选择流程（用户切走页面时调用）。
+pub(crate) fn cancel_pick() {
+    *CURRENT_PICK.lock().unwrap() = Some(PickState::Idle);
 }
 
 /// 自更新：把已下载的 APK 交给系统安装器（用户在系统弹窗确认）。

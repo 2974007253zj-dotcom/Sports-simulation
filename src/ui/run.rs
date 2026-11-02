@@ -555,22 +555,24 @@ impl App {
                     draw_pace_inputs(ui);
                 });
             }
-            mobile::row(ui, |ui| {
-                ui.label("手动海拔（米/区间）：");
+            mobile::labeled(ui, "手动海拔（米/区间）：", |ui| {
                 mobile::text_edit(
                     ui,
                     "run_manual_altitude",
                     &mut page.manual_altitude,
                     crate::platform::InputKind::Text,
-                    120.0,
+                    if compact { 160.0 } else { 120.0 },
                 );
-                ui.label("留空自动；可填 17.2 或 11.6-22.8");
+                ui.label(
+                    egui::RichText::new("留空自动；可填 17.2 或 11.6-22.8").small(),
+                );
             });
-            mobile::row(ui, |ui| {
-                ui.label("开始时间：");
-                ui.radio_value(&mut page.start_mode, 0, "随机时刻");
-                ui.radio_value(&mut page.start_mode, 1, "指定时刻");
-                ui.radio_value(&mut page.start_mode, 2, "现在时间");
+            mobile::labeled(ui, "开始时间：", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.radio_value(&mut page.start_mode, 0, "随机时刻");
+                    ui.radio_value(&mut page.start_mode, 1, "指定时刻");
+                    ui.radio_value(&mut page.start_mode, 2, "现在时间");
+                });
                 ui.label("日期：");
                 ui.add_enabled_ui(page.start_mode != 2, |ui| {
                     egui::ComboBox::from_id_salt("run_days_ago")
@@ -645,11 +647,12 @@ impl App {
                 ui.label("人脸校验标记：");
                 ui.checkbox(&mut page.face_check, "faceCheck=1");
             });
-            ui.horizontal(|ui| {
-                ui.label("路线算法：");
-                ui.selectable_value(&mut page.route_mode, RouteMode::Legacy, "经典打卡点环");
-                ui.selectable_value(&mut page.route_mode, RouteMode::Road, "真实道路路由");
-                ui.selectable_value(&mut page.route_mode, RouteMode::Custom, "自定义路线");
+            mobile::labeled(ui, "路线算法：", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut page.route_mode, RouteMode::Legacy, "经典打卡点环");
+                    ui.selectable_value(&mut page.route_mode, RouteMode::Road, "真实道路路由");
+                    ui.selectable_value(&mut page.route_mode, RouteMode::Custom, "自定义路线");
+                });
                 if page.route_mode == RouteMode::Road && self.network.is_none() {
                     ui.colored_label(theme::warn(), "（需先在「路网」页导入 OSM）");
                 }
@@ -725,6 +728,7 @@ impl App {
             }
             mobile::row(ui, |ui| {
                 ui.label("操场规格：");
+                let spec_before = page.track_spec;
                 egui::ComboBox::from_id_salt("run_track_spec")
                     .width(180.0)
                     .selected_text(match page.track_spec {
@@ -771,12 +775,18 @@ impl App {
                             format!("自定义 {custom_length} 米"),
                         );
                     });
+                // 操场规格变化必须让预览失效：否则地图还画着旧跑道的路线，
+                // 要等用户再动一下距离/配速才刷新。
+                if spec_before != page.track_spec {
+                    page.preview_stale = true;
+                }
                 if matches!(
                     page.track_spec,
                     crate::track::stadium::TrackSpec::Custom { .. }
                         | crate::track::stadium::TrackSpec::Loop { .. }
                 ) {
                     ui.label("长度");
+                    let len_before = page.custom_track_length.clone();
                     mobile::text_edit(
                         ui,
                         "run_custom_track_length",
@@ -785,10 +795,25 @@ impl App {
                         70.0,
                     );
                     ui.label("100-1000 米");
+                    // 改长度同样要重建跑道与预览
+                    if len_before != page.custom_track_length {
+                        page.preview_stale = true;
+                        // 同步到 TrackSpec，让生成器用新长度
+                        if let Ok(m) = page.custom_track_length.parse::<u32>() {
+                            if (100..=1000).contains(&m) {
+                                page.track_spec = match page.track_spec {
+                                    crate::track::stadium::TrackSpec::Loop { .. } => {
+                                        crate::track::stadium::TrackSpec::Loop { total_m: m }
+                                    }
+                                    _ => crate::track::stadium::TrackSpec::Custom { total_m: m },
+                                };
+                            }
+                        }
+                    }
                 }
             });
-            ui.horizontal(|ui| {
-                ui.label("路线颜色：");
+            mobile::labeled(ui, "路线颜色：", |ui| {
+                ui.horizontal_wrapped(|ui| {
                 ui.radio_value(
                     &mut page.track_color_mode,
                     crate::api::model::TrackColorMode::FullGreen,
@@ -799,6 +824,7 @@ impl App {
                     crate::api::model::TrackColorMode::HalfGreenGray,
                     "灰绿混合",
                 );
+                });
                 ui.label("（全绿色可避免详情页出现灰色分段）");
             });
         }
@@ -832,11 +858,21 @@ impl App {
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_default();
                 let (dist, pace, dur) = (p.dist, p.pace, p.dur);
-                format!(
-                    "本次方案：距离 {dist:.2} km · 配速 {}/km · 用时 {} · 开始 {start}",
-                    fmt_pace(pace),
-                    fmt_dur(dur)
-                )
+                if mobile::compact_ui(ui) {
+                    // 手机端一行放不下，拆成两行
+                    format!(
+                        "本次方案：{dist:.2} km · {}/km · {}
+开始 {start}",
+                        fmt_pace(pace),
+                        fmt_dur(dur)
+                    )
+                } else {
+                    format!(
+                        "本次方案：距离 {dist:.2} km · 配速 {}/km · 用时 {} · 开始 {start}",
+                        fmt_pace(pace),
+                        fmt_dur(dur)
+                    )
+                }
             }
             None => String::new(),
         };
@@ -986,8 +1022,15 @@ impl App {
 
         ui.add_space(4.0);
         let rect = ui.available_rect_before_wrap();
+        // 地图高度：桌面固定 240；手机按可用高度自适应（至少 260，最多占 45%），
+        // 让地图成为页面主体，而不是缩在角落里。
+        let map_h = if mobile::compact_ui(ui) {
+            (ui.available_height() * 0.45).clamp(260.0, 520.0)
+        } else {
+            240.0
+        };
         let (response, painter) = ui.allocate_painter(
-            egui::Vec2::new(rect.width().max(200.0), 240.0),
+            egui::Vec2::new(rect.width().max(200.0), map_h),
             egui::Sense::drag(),
         );
         let canvas = response.rect;

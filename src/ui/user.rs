@@ -35,9 +35,13 @@ impl App {
             return;
         };
 
+        // 禁用横向滚动：所有内容都必须在本宽内排布。若出现内容超宽，
+        // 说明网格宽度算错，应修网格而不是给用户一个能左右拖的页面。
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
+                ui.set_max_width(ui.available_width());
                 section(ui, "个人信息", |ui| {
                     let rows = profile_rows(&info.profile);
                     if rows.is_empty() {
@@ -82,12 +86,40 @@ fn section(ui: &mut egui::Ui, title: &str, add: impl FnOnce(&mut egui::Ui)) {
 
 fn grid(ui: &mut egui::Ui, id: &str, rows: &[(String, String)]) {
     if mobile::compact_ui(ui) {
-        for (k, v) in rows {
-            theme::card_frame().show(ui, |ui| {
-                ui.label(RichText::new(k).color(theme::text_dim()));
-                ui.label(RichText::new(v).color(theme::plain()));
+        // 手机端：方块每排 2 个铺满，换行后才继续下一排。
+        // 原先一个方块占满整行，字段多时要滚动很久。
+        // 关键：available_width 在 CollapsingHeader 缩进后可能偏大，且 frame 的
+        // inner_margin 会额外占宽度。这里显式把两列的总宽锁死在可用宽度内。
+        let cols = 2usize;
+        let gap = 6.0;
+        let margin_x = theme::GAP_SM;
+        let avail = ui.available_width().max(160.0);
+        // 每列外框宽度
+        let cell_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(72.0);
+        for chunk in rows.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (k, v) in chunk {
+                    let frame = egui::Frame::none()
+                        .fill(theme::PAGE)
+                        .rounding(egui::Rounding::same(theme::RADIUS_CARD))
+                        .inner_margin(egui::Margin::symmetric(margin_x, theme::GAP_XS));
+                    frame.show(ui, |ui| {
+                        // 内容宽度 = 外框 - 左右内边距，避免超出一列
+                        ui.set_max_width((cell_w - margin_x * 2.0).max(40.0));
+                        ui.label(
+                            egui::RichText::new(k)
+                                .small()
+                                .color(theme::text_dim()),
+                        );
+                        ui.label(
+                            egui::RichText::new(v)
+                                .color(theme::plain()),
+                        );
+                    });
+                }
             });
-            ui.add_space(4.0);
+            ui.add_space(gap);
         }
     } else {
         egui::Grid::new(id)

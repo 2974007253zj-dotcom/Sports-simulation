@@ -86,6 +86,23 @@ pub fn sync_clipboard(context: &egui::Context) {
     let _ = context;
 }
 
+/// 应用 Android 屏幕密度：让 egui 的逻辑像素等于 dp。
+///
+/// 不设置时 `pixels_per_point` 恒为 1.0，1080px 宽的手机在 egui 眼里就是
+/// 1080 逻辑像素，`is_compact`（阈值 620）永远为假，界面按桌面布局排版而错乱。
+/// 设置成 `DisplayMetrics.density`（如 2.75）后，1080px → 393dp，才会走手机布局。
+#[cfg(feature = "gui")]
+pub fn apply_density(context: &egui::Context) {
+    #[cfg(target_os = "android")]
+    if let Some(d) = crate::android::screen_density() {
+        if (context.pixels_per_point() - d).abs() > 1e-3 {
+            context.set_pixels_per_point(d);
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    let _ = context;
+}
+
 #[cfg(feature = "gui")]
 pub fn apply_safe_area(context: &egui::Context, input: &mut egui::RawInput) {
     #[cfg(target_os = "android")]

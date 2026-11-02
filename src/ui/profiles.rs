@@ -5,9 +5,7 @@
 //! 页面读到的是同一份配置，无需改动任何既有代码路径。
 
 use super::{mobile, theme, App};
-use crate::api::profiles::{ProfileBook, ProfileSlot};
-#[cfg(not(target_os = "android"))]
-use crate::api::profiles::ProfileExport;
+use crate::api::profiles::{ProfileBook, ProfileExport, ProfileSlot};
 use eframe::egui;
 
 #[derive(Default)]
@@ -25,6 +23,17 @@ pub struct ProfilesPage {
     pub export_with_password: bool,
     /// 上一次操作结果提示。
     pub status: String,
+    /// 等待文件对话框返回的操作（None = 空闲）。
+    pub pending: Option<PendingXfer>,
+}
+
+/// 正在等待系统文件对话框返回的操作。
+#[derive(Clone, Debug)]
+pub enum PendingXfer {
+    /// 导出：对话框回来后写入 JSON。
+    Export(String),
+    /// 导入：对话框回来后解析并合并。
+    Import,
 }
 
 impl App {
@@ -51,94 +60,6 @@ impl App {
         if !self.profiles_page.status.is_empty() {
             ui.colored_label(theme::plain(), &self.profiles_page.status);
         }
-        ui.separator();
-
-        // ── 现有档位列表 ──────────────────────────────────────
-        egui::ScrollArea::vertical()
-            .max_height(320.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                if book.slots.is_empty() {
-                    ui.label("还没有档位。下方填名称后点「保存当前配置」。");
-                }
-                let mut apply: Option<usize> = None;
-                let mut delete: Option<usize> = None;
-                let mut overwrite: Option<usize> = None;
-                // 先克隆出快照，避免在闭包里同时可变/不可变借用 book。
-                let slots: Vec<(usize, ProfileSlot, bool)> = book
-                    .slots
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| (i, s.clone(), book.active == Some(i)))
-                    .collect();
-                for (index, slot, active) in slots {
-                    let slot = &slot;
-                    ui.horizontal(|ui| {
-                        let title = if slot.name.trim().is_empty() {
-                            format!("档位 {}", index + 1)
-                        } else {
-                            slot.name.clone()
-                        };
-                        let label = if active {
-                            format!("● {title}")
-                        } else {
-                            format!("○ {title}")
-                        };
-                        ui.label(egui::RichText::new(label).strong());
-                        if !slot.username.is_empty() {
-                            ui.colored_label(theme::plain(), format!("账号 {}", mask_user(&slot.username)));
-                        }
-                        ui.label(
-                            egui::RichText::new(slot_summary(slot))
-                                .small()
-                                .color(theme::plain()),
-                        );
-                        // 设备指纹：每个账号一套，脱敏后只显示前 8 位便于区分。
-                        let device = match &slot.identity {
-                            Some(id) => format!("设备 {}", short_device_id(&id.device_id)),
-                            None => "设备 跟随全局".to_string(),
-                        };
-                        ui.label(
-                            egui::RichText::new(device)
-                                .small()
-                                .color(theme::text_dim()),
-                        );
-                        if !active && ui.small_button("应用").clicked() {
-                            apply = Some(index);
-                        }
-                        if ui.small_button("覆盖保存").clicked() {
-                            overwrite = Some(index);
-                        }
-                        if ui.small_button("删除").clicked() {
-                            delete = Some(index);
-                        }
-                    });
-                }
-                if let Some(index) = overwrite {
-                    let name = book.slots[index].name.clone();
-                    book.slots[index] =
-                        ProfileBook::capture(&name, &self.config, Some(&self.identity));
-                    let _ = book.save();
-                    self.profiles_page.status = format!("已用当前配置覆盖「{name}」");
-                }
-                if let Some(index) = apply {
-                    self.apply_profile(&mut book, index);
-                }
-                if let Some(index) = delete {
-                    let name = book.slots[index].name.clone();
-                    book.slots.remove(index);
-                    if book.active == Some(index) {
-                        book.active = None;
-                    } else if let Some(active) = book.active {
-                        if active > index {
-                            book.active = Some(active - 1);
-                        }
-                    }
-                    let _ = book.save();
-                    self.profiles_page.status = format!("已删除「{name}」");
-                }
-            });
-
         ui.separator();
 
         // ── 新建档位 ─────────────────────────────────────────
@@ -199,25 +120,165 @@ impl App {
         ui.add_space(8.0);
         ui.separator();
 
-        // ── 导入 / 导出（仅桌面；Android 无文件对话框后端）────────
-        #[cfg(not(target_os = "android"))]
-        {
-            ui.label("备份与迁移");
-            mobile::row(ui, |ui| {
-                ui.checkbox(
-                    &mut self.profiles_page.export_with_password,
-                    "导出时包含密码（文件将含明文密码，请妥善保管）",
-                );
-            });
-            mobile::row(ui, |ui| {
-                if ui.button("导出档位…").clicked() {
-                    self.export_profiles(&book);
-                }
-                if ui.button("导入档位…").clicked() {
-                    self.import_profiles(&mut book);
-                }
-            });
+        // ── 备份与迁移（与桌面 exe 相同的 JSON 文件格式，跨系统互通）──
+        ui.label("备份与迁移");
+        ui.add_space(4.0);
+        mobile::row(ui, |ui| {
+            ui.checkbox(
+                &mut self.profiles_page.export_with_password,
+                "导出时包含密码（含明文，请妥善保管）",
+            );
+        });
+        mobile::row(ui, |ui| {
+            if ui.button("导出到文件…").clicked() {
+                self.export_profiles(&book);
+            }
+            if ui.button("从文件导入…").clicked() {
+                self.import_profiles(&mut book);
+            }
+        });
+        if !self.profiles_page.status.is_empty() {
+            ui.label(
+                egui::RichText::new(self.profiles_page.status.clone())
+                    .small()
+                    .color(theme::plain()),
+            );
         }
+
+        // ── 现有档位列表 ──────────────────────────────────────
+        egui::ScrollArea::vertical()
+            .max_height(320.0)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                if book.slots.is_empty() {
+                    ui.label("还没有档位。下方填名称后点「保存当前配置」。");
+                }
+                let mut apply: Option<usize> = None;
+                let mut delete: Option<usize> = None;
+                let mut overwrite: Option<usize> = None;
+                // 先克隆出快照，避免在闭包里同时可变/不可变借用 book。
+                let slots: Vec<(usize, ProfileSlot, bool)> = book
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| (i, s.clone(), book.active == Some(i)))
+                    .collect();
+                for (index, slot, active) in slots {
+                    let slot = &slot;
+                    let title = if slot.name.trim().is_empty() {
+                        format!("档位 {}", index + 1)
+                    } else {
+                        slot.name.clone()
+                    };
+                    let label = if active {
+                        format!("● {title}")
+                    } else {
+                        format!("○ {title}")
+                    };
+
+                    if mobile::compact_ui(ui) {
+                        // 手机端：标题 + 操作按钮在第一行，明细在第二行自动换行。
+                        // 原先整行放 label，明细是一整串不可拆的文本，直接溢出到屏幕外。
+                        theme::card_frame().show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(&label).strong());
+                                if !active && ui.small_button("应用").clicked() {
+                                    apply = Some(index);
+                                }
+                                if ui.small_button("覆盖保存").clicked() {
+                                    overwrite = Some(index);
+                                }
+                                if ui.small_button("删除").clicked() {
+                                    delete = Some(index);
+                                }
+                            });
+                            // 明细分行展示：挤成一行时后半段会被截断，
+                            // 用户看不到设备 ID 和海拔等关键信息。
+                            let dim = |t: String| {
+                                egui::RichText::new(t)
+                                    .small()
+                                    .color(theme::plain())
+                            };
+                            if !slot.username.is_empty() {
+                                ui.label(dim(format!(
+                                    "账号 {}",
+                                    mask_user(&slot.username)
+                                )));
+                            }
+                            ui.label(dim(slot_summary(slot)));
+                            let device = match &slot.identity {
+                                Some(id) => {
+                                    format!("设备 {}", short_device_id(&id.device_id))
+                                }
+                                None => "设备 跟随全局".to_string(),
+                            };
+                            ui.label(
+                                egui::RichText::new(device)
+                                    .small()
+                                    .color(theme::text_dim()),
+                            );
+                        });
+                        ui.add_space(4.0);
+                        continue;
+                    }
+
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(label).strong());
+                        if !slot.username.is_empty() {
+                            ui.colored_label(theme::plain(), format!("账号 {}", mask_user(&slot.username)));
+                        }
+                        ui.label(
+                            egui::RichText::new(slot_summary(slot))
+                                .small()
+                                .color(theme::plain()),
+                        );
+                        // 设备指纹：每个账号一套，脱敏后只显示前 8 位便于区分。
+                        let device = match &slot.identity {
+                            Some(id) => format!("设备 {}", short_device_id(&id.device_id)),
+                            None => "设备 跟随全局".to_string(),
+                        };
+                        ui.label(
+                            egui::RichText::new(device)
+                                .small()
+                                .color(theme::text_dim()),
+                        );
+                        if !active && ui.small_button("应用").clicked() {
+                            apply = Some(index);
+                        }
+                        if ui.small_button("覆盖保存").clicked() {
+                            overwrite = Some(index);
+                        }
+                        if ui.small_button("删除").clicked() {
+                            delete = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = overwrite {
+                    let name = book.slots[index].name.clone();
+                    book.slots[index] =
+                        ProfileBook::capture(&name, &self.config, Some(&self.identity));
+                    let _ = book.save();
+                    self.profiles_page.status = format!("已用当前配置覆盖「{name}」");
+                }
+                if let Some(index) = apply {
+                    self.apply_profile(&mut book, index);
+                }
+                if let Some(index) = delete {
+                    let name = book.slots[index].name.clone();
+                    book.slots.remove(index);
+                    if book.active == Some(index) {
+                        book.active = None;
+                    } else if let Some(active) = book.active {
+                        if active > index {
+                            book.active = Some(active - 1);
+                        }
+                    }
+                    let _ = book.save();
+                    self.profiles_page.status = format!("已删除「{name}」");
+                }
+            });
+
+        ui.separator();
 
         ui.add_space(8.0);
         ui.separator();
@@ -230,7 +291,7 @@ impl App {
         );
     }
 
-    #[cfg(not(target_os = "android"))]
+    /// 导出：桌面用 rfd 同步对话框，Android 走异步 SAF（避免阻塞渲染线程）。
     fn export_profiles(&mut self, book: &ProfileBook) {
         if book.slots.is_empty() {
             self.profiles_page.status = "还没有档位可导出".into();
@@ -248,53 +309,78 @@ impl App {
             "neko-profiles-{}.json",
             chrono::Local::now().format("%Y%m%d-%H%M%S")
         );
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .set_file_name(default_name)
-            .save_file()
-        else {
-            return;
-        };
-        match std::fs::write(&path, json) {
-            Ok(()) => {
-                let note = if include_password {
-                    "（含明文密码）"
-                } else {
-                    "（已脱敏，不含密码）"
-                };
-                self.profiles_page.status =
-                    format!("已导出 {} 个档位到 {}{note}", book.slots.len(), path.display());
+
+        #[cfg(target_os = "android")]
+        {
+            crate::android::start_pick_write(&default_name, &json);
+            self.profiles_page.pending = Some(PendingXfer::Export(json));
+            self.profiles_page.status = "请在系统对话框中选择保存位置…".into();
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = &json;
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .set_file_name(default_name)
+                .save_file()
+            else {
+                return;
+            };
+            match std::fs::write(&path, json) {
+                Ok(()) => {
+                    self.profiles_page.status = format!(
+                        "已导出 {} 个档位到 {}{}",
+                        book.slots.len(),
+                        path.display(),
+                        if include_password { "（含明文密码）" } else { "（已脱敏）" }
+                    )
+                }
+                Err(e) => self.profiles_page.status = format!("写入文件失败：{e}"),
             }
-            Err(e) => self.profiles_page.status = format!("写入文件失败：{e}"),
         }
     }
 
-    #[cfg(not(target_os = "android"))]
+    /// 导入：同样分平台处理。
     fn import_profiles(&mut self, book: &mut ProfileBook) {
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .pick_file()
-        else {
-            return;
-        };
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) => {
-                self.profiles_page.status = format!("读取文件失败：{e}");
+        #[cfg(target_os = "android")]
+        {
+            crate::android::start_pick_read();
+            self.profiles_page.pending = Some(PendingXfer::Import);
+            self.profiles_page.status = "请在系统对话框中选择档位文件…".into();
+            let _ = book;
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .pick_file()
+            else {
                 return;
-            }
-        };
-        let imported = match ProfileExport::read(&text) {
+            };
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.profiles_page.status = format!("读取文件失败：{e}");
+                    return;
+                }
+            };
+            Self::apply_import(book, &text, &mut self.profiles_page.status);
+        }
+    }
+
+    /// 解析并合并导入的 JSON（两端共用）。
+    fn apply_import(book: &mut ProfileBook, text: &str, status: &mut String) {
+        let imported = match ProfileExport::read(text) {
             Ok(slots) => slots,
             Err(e) => {
-                self.profiles_page.status = format!("导入失败：{e}");
+                *status = format!("导入失败：{e}");
                 return;
             }
         };
         let count = imported.len();
         let added = crate::api::profiles::merge_slots(book, imported);
         if let Err(e) = book.save() {
-            self.profiles_page.status = format!("导入后保存失败：{e}");
+            *status = format!("导入后保存失败：{e}");
             return;
         }
         let names = if added.len() <= 3 {
@@ -303,7 +389,40 @@ impl App {
             let preview: Vec<&str> = added.iter().take(3).map(String::as_str).collect();
             format!("{} 等", preview.join("、"))
         };
-        self.profiles_page.status = format!("已导入 {count} 个档位：{names}");
+        *status = format!("已导入 {count} 个档位：{names}");
+    }
+
+    /// 每帧检查文件对话框是否已返回（仅 Android）。
+    #[cfg(target_os = "android")]
+    pub(super) fn poll_profile_transfer(&mut self) {
+        let Some(pending) = self.profiles_page.pending.clone() else {
+            return;
+        };
+        match pending {
+            PendingXfer::Export(_) => {
+                if let Some(result) = crate::android::poll_pick_write() {
+                    self.profiles_page.pending = None;
+                    self.profiles_page.status = match result {
+                        Ok(()) => "导出完成".to_string(),
+                        Err(e) => format!("导出失败：{e}"),
+                    };
+                }
+            }
+            PendingXfer::Import => {
+                if let Some(result) = crate::android::poll_pick_read() {
+                    self.profiles_page.pending = None;
+                    match result {
+                        Ok(text) => {
+                            let mut book = ProfileBook::load();
+                            let mut status = String::new();
+                            Self::apply_import(&mut book, &text, &mut status);
+                            self.profiles_page.status = status;
+                        }
+                        Err(e) => self.profiles_page.status = format!("读取失败：{e}"),
+                    }
+                }
+            }
+        }
     }
 
     /// 把当前设备身份写回「激活中的档位」；没有激活档位返回 false。

@@ -303,33 +303,50 @@ impl App {
                         let rrid = r.rrid;
                         let (pace_min, pace_sec) = pace_of(r.total_dis, r.total_time);
                         theme::card_frame().show(ui, |ui| {
-                            mobile::row(ui, |ui| {
-                                ui.strong(fmt_time(r.start_time));
-                                if r.is_flagged() {
-                                    ui.colored_label(theme::err(), if r.status == 2 { "已判违规" } else { "被标记" });
+                            // 每条记录压成一行：状态 · 时间 · 距离 · 时长 · 配速 · 步频 · 详情
+                            ui.horizontal(|ui| {
+                                let (mark, color) = if r.is_flagged() {
+                                    (
+                                        if r.status == 2 { "已判违规" } else { "被标记" },
+                                        theme::err(),
+                                    )
                                 } else if r.complete {
-                                    ui.colored_label(theme::ok(), "达标");
+                                    ("达标", theme::ok())
                                 } else {
-                                    ui.colored_label(theme::err(), "未达标");
-                                }
+                                    ("未达标", theme::err())
+                                };
+                                ui.colored_label(color, mark);
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{:.2}km · {} · {pace_min}:{pace_sec:02}/km · {}spm",
+                                        r.total_dis / 1000.0,
+                                        fmt_dur(r.total_time),
+                                        r.avg_step_freq,
+                                    ))
+                                    .small(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add_sized(
+                                                [56.0, 30.0],
+                                                egui::Button::new(
+                                                    egui::RichText::new("详情").small(),
+                                                ),
+                                            )
+                                            .clicked()
+                                        {
+                                            toggle_target.set(Some(rrid));
+                                        }
+                                    },
+                                );
                             });
                             if r.is_flagged() && !r.appeal_note().is_empty() {
                                 ui.colored_label(theme::err(), r.appeal_note());
                             }
-                            ui.label(format!(
-                                "{:.2} km · {} · 配速 {pace_min}:{pace_sec:02}/km",
-                                r.total_dis / 1000.0,
-                                fmt_dur(r.total_time),
-                            ));
-                            ui.label(format!("步频 {} spm · rrid {rrid}", r.avg_step_freq));
-                            if ui
-                                .add_sized([96.0, mobile::TOUCH_HEIGHT], egui::Button::new("详情"))
-                                .clicked()
-                            {
-                                toggle_target.set(Some(rrid));
-                            }
                         });
-                        ui.add_space(6.0);
+                        ui.add_space(3.0);
                     }
                 });
             if let Some(rrid) = toggle_target.get() {
@@ -763,15 +780,33 @@ fn draw_detail_panel(ui: &mut egui::Ui, raw: &serde_json::Value) {
         }
     }
     if mobile::compact_ui(ui) {
-        for (k, v) in &items {
-            if v.is_empty() || v == "0" || v == "0.0" {
-                continue;
-            }
-            theme::card_frame().show(ui, |ui| {
-                ui.label(egui::RichText::new(*k).color(theme::text_dim()));
-                ui.label(egui::RichText::new(v).color(theme::text()));
+        // 手机端：方块按每排 2 个铺满，不再一个占满整行（浪费空间）。
+        let shown: Vec<(&str, &String)> = items
+            .iter()
+            .filter(|(_, v)| !v.is_empty() && v != "0" && v != "0.0")
+            .map(|(k, v)| (*k, v))
+            .collect();
+        let cols = 2usize;
+        let gap = 6.0;
+        let margin_x = theme::GAP_SM;
+        let avail = ui.available_width().max(160.0);
+        let cell_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(72.0);
+        for chunk in shown.chunks(cols) {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (k, v) in chunk {
+                    let frame = egui::Frame::none()
+                        .fill(theme::PAGE)
+                        .rounding(egui::Rounding::same(theme::RADIUS_CARD))
+                        .inner_margin(egui::Margin::symmetric(margin_x, theme::GAP_XS));
+                    frame.show(ui, |ui| {
+                        ui.set_max_width((cell_w - margin_x * 2.0).max(40.0));
+                        ui.label(egui::RichText::new(*k).small().color(theme::text_dim()));
+                        ui.label(egui::RichText::new(*v).color(theme::text()));
+                    });
+                }
             });
-            ui.add_space(4.0);
+            ui.add_space(gap);
         }
     } else {
         egui::Grid::new("detail_grid")

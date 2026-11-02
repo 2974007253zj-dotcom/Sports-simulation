@@ -30,6 +30,28 @@ pub fn row<R>(
     }
 }
 
+/// 「标签 + 控件」的一行。
+///
+/// 桌面端同排（标签在左、控件在右）；手机端**标签独占一行**、控件另起一行。
+/// 直接用 `horizontal_wrapped` 时，固定宽度的输入框会让整行溢出屏幕右侧，
+/// 而 egui 不会把单个元素拆开，所以必须显式分行。
+pub fn labeled<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    add_control: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    if compact_ui(ui) {
+        ui.label(label);
+        ui.indent("labeled_ctl", |ui| add_control(ui)).inner
+    } else {
+        ui.horizontal(|ui| {
+            ui.label(label);
+            add_control(ui)
+        })
+        .inner
+    }
+}
+
 #[cfg(any(target_os = "android", test))]
 pub fn parse_i64_in_range(input: &str, range: RangeInclusive<i64>) -> Result<i64, String> {
     let value = input
@@ -150,29 +172,32 @@ pub const TABS: [&str; 10] = [
     "关于",
 ];
 
+/// 顶部标签栏。
+///
+/// 手机端用**单行横向滚动**（类似主流 App 的顶部 tab），而不是多行网格：
+/// 多行网格会占掉近半屏高度，把真正的内容挤下去。
+/// 选中项变化时自动滚动到可见区域。
 pub fn tab_bar(ui: &mut egui::Ui, selected: &mut usize) -> Vec<egui::Response> {
     let compact = compact_ui(ui);
     let mut responses = Vec::with_capacity(TABS.len());
+
     if compact {
-        // 行内间距置 0，按 4 等分。**不设 68px 下限**：窗口窄时下限会把 4 个
-        // 格子撑出可用宽度，最右标签被切掉（实测 360px 下「数据」压在边缘外）。
-        // 每格再减 1px 吸收取整误差，保证 4 格之和不超过可用宽度。
-        let width = ((ui.available_width() / 4.0) - 1.0).max(1.0);
-        // 10 个标签均分 4/3/3（4+4+2 会让末行只剩两个、右侧留半排空位）。
-        // 显式分行 + 0 间距：依赖自动换行的等宽网格在边框取整边界上不可靠。
-        // 显式垂直排布并按总高度预留空间：CentralPanel 里连续三个
-        // `ui.horizontal()` 时，后两行会因为没有预分配高度被挤到面板外
-        // （截图实测只有第一行可见）。
-        let rows = balanced_chunks(TABS.len(), 3);
-        // 必须用 vertical 包住多行：直接在 CentralPanel 里连续 ui.horizontal()
-        // 时，后续行不会获得垂直空间，会被挤到面板外（实测只有第一行可见）。
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = theme::GAP_XS;
-            for chunk in rows {
+        // 每格宽度：至少能放下 4 个字（配置档位/设备信息），否则文字会被裁切。
+        let avail = ui.available_width();
+        let width = ((avail / 4.0) - 1.0).clamp(88.0, 120.0);
+        let scroll_id = ui.make_persistent_id("tab_bar_scroll");
+        egui::ScrollArea::horizontal()
+            .id_salt(scroll_id)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .auto_shrink([false, true])
+            // 关键：滚动区必须占满可用宽度，否则内容会被父容器的
+            // set_width 夹住，首尾标签被裁掉（实测「设备信息」「关于」被切）。
+            .max_width(avail)
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    for (offset, label) in TABS[chunk.clone()].iter().enumerate() {
-                        let index = chunk.start + offset;
+                    for (index, label) in TABS.iter().enumerate() {
                         let response = tab_item(
                             ui,
                             egui::vec2(width, TOUCH_HEIGHT),
@@ -181,14 +206,16 @@ pub fn tab_bar(ui: &mut egui::Ui, selected: &mut usize) -> Vec<egui::Response> {
                         );
                         if response.clicked() {
                             *selected = index;
+                            // 点击后把该项滚到可见区域，避免选了却看不见。
+                            response.scroll_to_me(Some(egui::Align::Center));
                         }
                         responses.push(response);
                     }
                 });
-            }
-        });
+            });
         return responses;
     }
+
     // 桌面端按文字宽度排布，行内换行兜底，窄窗口下也不会溢出。
     ui.horizontal_wrapped(|ui| {
         for (index, label) in TABS.into_iter().enumerate() {
@@ -465,6 +492,27 @@ mod tests {
         assert!(!is_compact(880.0));
     }
 
+    /// 手机物理宽度必须经过密度换算后才会进入 compact 布局。
+    ///
+    /// 这是 APK 布局错乱的根因：egui 默认 pixels_per_point = 1.0，
+    /// 1080px 宽的屏幕被当成 1080 逻辑像素，永远大于 620，于是走桌面布局。
+    #[test]
+    fn physical_width_needs_density_scaling_to_become_compact() {
+        // 常见手机：1080×2400，密度 2.75（≈393dp）
+        let physical_w = 1080.0f32;
+        let density = 2.75f32;
+        assert!(!is_compact(physical_w), "未缩放时会被误判为桌面宽屏");
+        assert!(
+            is_compact(physical_w / density),
+            "按 density 缩放后应进入 compact 布局：{}dp",
+            physical_w / density
+        );
+        // 另一组：1080×2340，密度 3.0（360dp）
+        assert!(is_compact(1080.0 / 3.0));
+        // 平板横屏 2560px / 2.0 = 1280dp → 仍走桌面布局，符合预期
+        assert!(!is_compact(2560.0 / 2.0));
+    }
+
     #[test]
     fn integer_input_rejects_invalid_or_out_of_range_without_a_replacement() {
         assert_eq!(parse_i64_in_range(" 23 ", 0..=23), Ok(23));
@@ -505,13 +553,28 @@ mod tests {
             assert!(rects
                 .iter()
                 .all(|rect| rect.is_finite() && rect.width() > 0.0));
-            assert!(
-                rects.iter().all(|rect| rect.max.x <= width + 0.5),
-                "width={width}: {rects:?}"
-            );
             if is_compact(width) {
+                // 手机端是横向滚动条：标签按顺序向右延伸、允许超出屏幕宽度，
+                // 但不能出现竖直方向的换行（所有 rect 的 y 必须相同）。
+                let y0 = rects[0].min.y;
+                assert!(
+                    rects.iter().all(|r| (r.min.y - y0).abs() < 0.5),
+                    "width={width}: 标签不应换行 {rects:?}"
+                );
                 assert!(
                     rects.iter().all(|rect| rect.height() >= 44.0),
+                    "width={width}: {rects:?}"
+                );
+                // 相邻标签水平紧邻、不重叠
+                for pair in rects.windows(2) {
+                    assert!(
+                        pair[1].min.x >= pair[0].max.x - 0.5,
+                        "width={width}: 标签重叠 {pair:?}"
+                    );
+                }
+            } else {
+                assert!(
+                    rects.iter().all(|rect| rect.max.x <= width + 0.5),
                     "width={width}: {rects:?}"
                 );
             }

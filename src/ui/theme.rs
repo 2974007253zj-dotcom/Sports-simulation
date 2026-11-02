@@ -54,10 +54,23 @@ pub const GAP_XL: f32 = 24.0;
 pub const RADIUS_CONTROL: f32 = 6.0;
 pub const RADIUS_CARD: f32 = 10.0;
 
-/// 字号：标题 16 / 正文 13 / 辅助 11。
+/// 字号：标题 16 / 正文 13 / 辅助 11（桌面）。
+///
+/// 手机端统一放大一档：`.small()` 会在基础字号上再乘 0.8，11pt 在手机上
+/// 只有 8.8pt，中文密集时笔画糊在一起、难以辨认（实测反馈「小字显示有问题」）。
+#[cfg(not(target_os = "android"))]
 pub const FONT_TITLE: f32 = 16.0;
+#[cfg(not(target_os = "android"))]
 pub const FONT_BODY: f32 = 13.0;
+#[cfg(not(target_os = "android"))]
 pub const FONT_AUX: f32 = 11.0;
+
+#[cfg(target_os = "android")]
+pub const FONT_TITLE: f32 = 18.0;
+#[cfg(target_os = "android")]
+pub const FONT_BODY: f32 = 15.0;
+#[cfg(target_os = "android")]
+pub const FONT_AUX: f32 = 13.0;
 
 // ── 旧接口（保持名字与签名）────────────────────────────────────
 
@@ -252,6 +265,17 @@ pub fn apply_visuals(ctx: &egui::Context) {
     {
         style.spacing.interact_size = egui::vec2(44.0, 44.0);
         style.spacing.button_padding = egui::vec2(14.0, 10.0);
+        // egui 默认 Body=12.5 / Small=9，手机上 Small 只有 9pt，
+        // 中文笔画糊成一团（实测反馈「小字显示有问题」）。整体上调一档。
+        use egui::{FontFamily, FontId, TextStyle};
+        style.text_styles = [
+            (TextStyle::Heading, FontId::new(FONT_TITLE, FontFamily::Proportional)),
+            (TextStyle::Body, FontId::new(FONT_BODY, FontFamily::Proportional)),
+            (TextStyle::Button, FontId::new(FONT_BODY, FontFamily::Proportional)),
+            (TextStyle::Small, FontId::new(FONT_AUX, FontFamily::Proportional)),
+            (TextStyle::Monospace, FontId::new(FONT_AUX, FontFamily::Monospace)),
+        ]
+        .into();
     }
 
     // 页面文字仅作展示：不可选中、不可复制，输入框不受影响

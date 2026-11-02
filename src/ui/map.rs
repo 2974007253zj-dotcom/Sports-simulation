@@ -77,18 +77,30 @@ impl MapState {
     }
 
     /// 处理拖拽/缩放交互（需在分配好 rect 后调用）。
+    ///
+    /// 同时支持桌面（滚轮缩放）与触屏（双指捏合缩放）：
+    /// 手机上 `raw_scroll_delta` 恒为 0，只有 `zoom_delta` 才有值。
     pub fn interact(&mut self, ui: &egui::Ui, rect: Rect) {
         self.dragged = false;
-        let (drag, scroll) = ui.input(|i| {
+        let (drag, scroll, zoom, two_finger) = ui.input(|i| {
             let hover = i
                 .pointer
                 .interact_pos()
                 .map(|p| rect.contains(p))
                 .unwrap_or(false);
-            let dragging = hover && i.pointer.primary_down() && i.pointer.is_decidedly_dragging();
-            (dragging, i.raw_scroll_delta.y)
+            // 触屏拖动的判定阈值比鼠标低，否则手指小幅移动不会触发
+            let dragging = hover
+                && i.pointer.primary_down()
+                && (i.pointer.is_decidedly_dragging() || cfg!(target_os = "android"));
+            (
+                dragging,
+                i.raw_scroll_delta.y,
+                i.zoom_delta(),
+                i.multi_touch().is_some(),
+            )
         });
-        if drag {
+        // 双指手势用于缩放时不要同时平移，否则地图会跟着手指乱跑
+        if drag && !two_finger {
             let d = ui.input(|i| i.pointer.delta());
             self.offset += d;
             self.dragged = true;
@@ -96,6 +108,9 @@ impl MapState {
         if scroll != 0.0 {
             let factor = (scroll * 0.0015).exp();
             self.scale = (self.scale * factor).clamp(0.002, 200.0);
+        }
+        if (zoom - 1.0).abs() > 1e-3 {
+            self.scale = (self.scale * zoom).clamp(0.002, 200.0);
         }
     }
 

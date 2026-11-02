@@ -8,6 +8,9 @@ use route_planner::{Coord, RoadGraph};
 use super::map::{collect_bounds, MapState};
 use super::{mobile, theme, App};
 
+/// 路网页面进度消息前缀（OSM 页自用）。
+const OSM_STATUS: &str = "__OSM_STATUS__";
+
 #[derive(Default)]
 pub struct OsmPage {
     pub path: String,
@@ -111,6 +114,21 @@ fn cached_points_bd(app: &App) -> Vec<(f64, f64)> {
         .unwrap_or_default()
 }
 
+
+/// 后台线程写入的进度文本（UI 每帧读取后清空）。
+static OSM_PROGRESS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 后台线程更新进度文本。
+fn send_status(text: &str) -> bool {
+    *OSM_PROGRESS.lock().unwrap() = Some(text.to_string());
+    true
+}
+
+/// UI 线程取走最新进度（没有则返回 None）。
+pub(crate) fn take_osm_progress() -> Option<String> {
+    OSM_PROGRESS.lock().unwrap().take()
+}
+
 /// 缓存下载时间（毫秒时间戳）→ 本地时间 `YYYY-MM-DD HH:MM`。
 fn fmt_cache_time(ms: i64) -> String {
     use chrono::TimeZone as _;
@@ -123,6 +141,16 @@ fn fmt_cache_time(ms: i64) -> String {
 
 impl App {
     pub fn draw_osm_page(&mut self, ui: &mut egui::Ui) {
+        // 整页放进滚动区：手机屏幕小，控件 + 地图加起来远超一屏；
+        // 不滚动时地图会被推到屏幕外，用户只看到「加载成功」却看不到图。
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.draw_osm_page_inner(ui);
+            });
+    }
+
+    fn draw_osm_page_inner(&mut self, ui: &mut egui::Ui) {
         let mut load_now = false;
 
         // ── 自动获取（按学校围栏）────────────────────────────
@@ -160,40 +188,46 @@ impl App {
         );
         let mut want_search = false;
         let mut want_near = false;
-        ui.horizontal(|ui| {
-            ui.label("校名：");
-            ui.add_sized(
-                [240.0, 24.0],
-                egui::TextEdit::singleline(&mut self.osm_page.campus_query)
-                    .hint_text("例如：北京大学"),
-            );
-            if ui
-                .add_enabled(
-                    !self.osm_page.campus_busy && !self.osm_page.campus_query.trim().is_empty(),
-                    egui::Button::new("搜索校园"),
-                )
-                .clicked()
-            {
-                want_search = true;
-            }
+        let compact = mobile::compact_ui(ui);
+        mobile::labeled(ui, "校名：", |ui| {
+            let w = if compact {
+                ui.available_width().min(240.0)
+            } else {
+                240.0
+            };
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [w, if compact { mobile::TOUCH_HEIGHT } else { 24.0 }],
+                    egui::TextEdit::singleline(&mut self.osm_page.campus_query)
+                        .hint_text("例如：北京大学"),
+                );
+                if ui
+                    .add_enabled(
+                        !self.osm_page.campus_busy
+                            && !self.osm_page.campus_query.trim().is_empty(),
+                        egui::Button::new("搜索校园"),
+                    )
+                    .clicked()
+                {
+                    want_search = true;
+                }
+            });
             if self.osm_page.campus_busy {
                 ui.label("搜索中…");
             }
         });
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("找不到？用定位锚点按范围找（不依赖 OSM 标签）：")
-                    .small()
-                    .color(theme::text_dim()),
-            );
-            if ui
-                .add_enabled(!self.osm_page.campus_busy, egui::Button::new("按锚点范围查找"))
-                .on_hover_text("取定位锚点周围 800 米内所有闭合区域，可能包含操场/建筑，需目视确认")
-                .clicked()
-            {
-                want_near = true;
-            }
-        });
+        ui.label(
+            egui::RichText::new("找不到？用定位锚点按范围找（不依赖 OSM 标签）：")
+                .small()
+                .color(theme::text_dim()),
+        );
+        if ui
+            .add_enabled(!self.osm_page.campus_busy, egui::Button::new("按锚点范围查找"))
+            .on_hover_text("取定位锚点周围 800 米内所有闭合区域，可能包含操场/建筑，需目视确认")
+            .clicked()
+        {
+            want_near = true;
+        }
         if !self.osm_page.campus_status.is_empty() {
             ui.add(egui::Label::new(&self.osm_page.campus_status).wrap());
         }
@@ -247,49 +281,74 @@ impl App {
         ui.separator();
         ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
-            ui.label("OSM 文件：");
+        // OSM 文件：手机端标签一行、输入框占满、按钮另起；桌面端同排。
+        mobile::labeled(ui, "OSM 文件：", |ui| {
+            let compact = mobile::compact_ui(ui);
+            let w = if compact {
+                ui.available_width().min(360.0)
+            } else {
+                340.0
+            };
             ui.add_sized(
-                [340.0, 26.0],
+                [w, if compact { mobile::TOUCH_HEIGHT } else { 26.0 }],
                 egui::TextEdit::singleline(&mut self.osm_page.path)
                     .hint_text("拖入 .osm 文件或填写路径"),
             );
-            #[cfg(not(target_os = "android"))]
-            if ui.button("浏览…").clicked() {
-                if let Some(p) = rfd::FileDialog::new()
-                    .add_filter("OSM", &["osm", "xml", "pbf"])
-                    .pick_file()
-                {
-                    self.osm_page.path = p.display().to_string();
+            if compact {
+                ui.horizontal_wrapped(|ui| {
+                    #[cfg(not(target_os = "android"))]
+                    if ui.button("浏览…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new()
+                            .add_filter("OSM", &["osm", "xml", "pbf"])
+                            .pick_file()
+                        {
+                            self.osm_page.path = p.display().to_string();
+                        }
+                    }
+                    let can_load = !self.osm_page.path.is_empty() && !self.osm_page.busy;
+                    if ui
+                        .add_enabled(can_load, theme::primary_btn("加载路网"))
+                        .clicked()
+                    {
+                        load_now = true;
+                    }
+                });
+            } else {
+                #[cfg(not(target_os = "android"))]
+                if ui.button("浏览…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new()
+                        .add_filter("OSM", &["osm", "xml", "pbf"])
+                        .pick_file()
+                    {
+                        self.osm_page.path = p.display().to_string();
+                    }
                 }
-            }
-            let can_load = !self.osm_page.path.is_empty() && !self.osm_page.busy;
-            if ui
-                .add_enabled(can_load, theme::primary_btn("加载路网"))
-                .clicked()
-            {
-                load_now = true;
+                let can_load = !self.osm_page.path.is_empty() && !self.osm_page.busy;
+                if ui
+                    .add_enabled(can_load, theme::primary_btn("加载路网"))
+                    .clicked()
+                {
+                    load_now = true;
+                }
             }
         });
         // 手动下载入口：自动获取失败或需要更大范围时，用户可到 OSM 自己框选导出。
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("没有路网文件？到 OpenStreetMap 框选区域导出 .osm：")
-                    .small()
-                    .color(theme::text_dim()),
-            );
-            ui.hyperlink_to(
-                egui::RichText::new("https://www.openstreetmap.org")
-                    .small()
-                    .color(theme::PRIMARY),
-                "https://www.openstreetmap.org",
-            );
-            ui.label(
-                egui::RichText::new("（导出 → 导出为 .osm 文件）")
-                    .small()
-                    .color(theme::text_dim()),
-            );
-        });
+        ui.label(
+            egui::RichText::new("没有路网文件？到 OpenStreetMap 框选区域导出 .osm：")
+                .small()
+                .color(theme::text_dim()),
+        );
+        ui.hyperlink_to(
+            egui::RichText::new("www.openstreetmap.org")
+                .small()
+                .color(theme::PRIMARY),
+            "https://www.openstreetmap.org",
+        );
+        ui.label(
+            egui::RichText::new("（导出 → 导出为 .osm 文件）")
+                .small()
+                .color(theme::text_dim()),
+        );
 
         // 拖拽导入
         let dropped: Vec<String> = ui.ctx().input(|i| {
@@ -407,9 +466,15 @@ impl App {
                 ],
             );
         }
+        // 地图高度：手机端按屏幕比例给定高度，避免被前面的控件挤到几乎不可见；
+        // 也不能用 available_rect 的剩余高度——那里可能是 0 或是整屏（导致
+        // fit() 算出的 scale 极端，路网缩成一个点）。
+        // 滚动区里 available_height 不可靠（可能是无限大），给固定高度。
+        let compact_map = mobile::compact_ui(ui);
+        let map_h = if compact_map { 300.0 } else { 360.0 };
         let rect = ui.available_rect_before_wrap();
         let (response, painter) = ui.allocate_painter(
-            egui::Vec2::new(rect.width().max(200.0), rect.height().max(220.0)),
+            egui::Vec2::new(rect.width().max(200.0), map_h),
             egui::Sense::drag(),
         );
         let canvas = response.rect;
@@ -510,18 +575,75 @@ impl App {
         }
         self.osm_page.busy = true;
         self.osm_page.source = "school".into();
-        self.osm_page.status = "正在获取学校围栏并下载路网…".into();
+        self.osm_page.status = "正在获取学校围栏与点位…".into();
 
-        let fences = crate::api::model::load_fence_cache().unwrap_or_default();
-        let points = cached_points_bd(self);
-
-        let tx = self.net_tx.clone();
+        let identity = self.identity.clone();
         let school = sess.unid.clone();
         let refresh = self.osm_page.refresh;
-        // 取消句柄归界面所有：后台线程只持 clone，用户点「取消」能立刻生效。
+        let tx = self.net_tx.clone();
         let control = std::sync::Arc::new(crate::task_control::Control::default());
         self.osm_page.osm_control = control.clone();
+
         spawn_net_job(tx, move || {
+            let mut client = crate::api::client::ApiClient::new(identity.clone(), Some(sess));
+
+            // 围栏与点位可能还没缓存（用户没在跑步页拉过）。
+            // 这里主动获取一次，避免「缺少有效点位，不能确定下载范围」。
+            let mut fences = crate::api::model::load_fence_cache().unwrap_or_default();
+            if fences.is_empty() {
+                let _ = send_status("正在获取电子围栏…");
+                match crate::api::fence::fetch_geo_fence(&mut client) {
+                    Ok(f) => {
+                        let _ = crate::api::model::save_fence_cache(&f);
+                        fences = f;
+                    }
+                    Err(e) => {
+                        send_status(&format!(
+                            "电子围栏获取失败：{e}；将改用打卡点确定范围"
+                        ));
+                    }
+                }
+            }
+
+            let mut points: Vec<(f64, f64)> = crate::api::model::load_points_cache_for(
+                identity.anchor_coordinate().unwrap_or_else(|_| {
+                    crate::location::Coordinate::new(39.9, 116.4, 0.0).unwrap()
+                }),
+            )
+            .map(|(_ts, pts)| {
+                pts.iter()
+                    .filter_map(|p| Some((p.get("lat")?.as_f64()?, p.get("lon")?.as_f64()?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+            if points.is_empty() {
+                let _ = send_status("正在获取打卡点…");
+                if let Ok(anchor) = identity.anchor_coordinate() {
+                    match crate::api::points::fetch_points(&mut client, anchor, &mut |_| {}) {
+                        Ok(pts) => {
+                            points = pts
+                                .iter()
+                                .filter_map(|p| {
+                                    Some((p.get("lat")?.as_f64()?, p.get("lon")?.as_f64()?))
+                                })
+                                .collect();
+                        }
+                        Err(e) => {
+                            send_status(&format!("打卡点获取失败：{e}"));
+                        }
+                    }
+                }
+            }
+
+            if fences.is_empty() && points.is_empty() {
+                return Err(
+                    "无法确定路网范围：既没有电子围栏也没有打卡点。\n\
+                     请先在「设备信息」页确认定位锚点，或到「跑步」页切换为「真实道路路由」拉取一次点位。"
+                        .into(),
+                );
+            }
+
+            let _ = send_status("正在下载路网（可能较慢）…");
             let mut net = crate::api::school_roads::load_for_route(
                 "",
                 &school,

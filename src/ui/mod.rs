@@ -114,6 +114,9 @@ impl eframe::App for App {
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        // 密度必须早于安全区计算：apply_safe_area 用 pixels_per_point 把
+        // 物理像素的安全区换算成逻辑像素，顺序反了会算错边距。
+        crate::platform::apply_density(ctx);
         crate::platform::apply_safe_area(ctx, input);
     }
 
@@ -123,6 +126,15 @@ impl eframe::App for App {
         self.poll_device_info();
         crate::platform::set_keep_screen_on(self.run_busy || self.ai_busy || self.login_busy);
         ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // 配置档位的文件对话框是异步的：每帧检查一次结果，
+        // 等待期间保持重绘，用户选完文件后立刻反映到界面。
+        #[cfg(target_os = "android")]
+        {
+            self.poll_profile_transfer();
+            if self.profiles_page.pending.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+            }
+        }
 
         // ── 顶栏 ────────────────────────────────────────────────
         egui::TopBottomPanel::top("top_bar")
@@ -169,38 +181,53 @@ impl eframe::App for App {
                 }
             };
             if compact {
+                // 手机端顶栏压缩成尽量少的行：
+                //   第 1 行  状态（IP / 账号 / uid）—— 一行内换行兜底
+                //   第 2 行  账号 + 密码 + 按钮（同一行，输入框自适应）
+                //   已登录时只保留第 1 行 + 登出按钮，不再显示密码框。
                 ui.horizontal_wrapped(draw_connection);
-                ui.label(
-                    egui::RichText::new(format!("设备：{}", self.identity.device_id))
-                        .small()
-                        .color(theme::text_dim()),
-                );
-                mobile::row(ui, |ui| {
-                    ui.label(egui::RichText::new("账号").small().color(theme::text_dim()));
-                    mobile::text_edit(
-                        ui,
-                        "login_username",
-                        &mut self.username,
-                        crate::platform::InputKind::Text,
-                        ui.available_width().min(200.0),
-                    );
-                });
-                mobile::row(ui, |ui| {
-                    ui.label(egui::RichText::new("密码").small().color(theme::text_dim()));
-                    mobile::text_edit(
-                        ui,
-                        "login_password",
-                        &mut self.password,
-                        crate::platform::InputKind::Password,
-                        ui.available_width().min(200.0),
-                    );
-                });
-                mobile::row(ui, |ui| {
-                    ui.checkbox(&mut self.remember, "记住密码");
-                    login_clicked = ui
-                        .add(theme::primary_btn_enabled(btn_text, !self.login_busy))
-                        .clicked();
-                });
+                let logged = self.session.is_some();
+                if logged {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                login_clicked = ui
+                                    .add(theme::primary_btn_enabled(btn_text, !self.login_busy))
+                                    .clicked();
+                            },
+                        );
+                    });
+                } else {
+                    // 账号/密码并排，按钮跟在右侧；可用宽度不足时自动换行。
+                    let total = ui.available_width();
+                    let btn_w = 88.0;
+                    let gap = theme::GAP_SM;
+                    let field_w = ((total - btn_w - gap * 3.0) / 2.0).max(84.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        mobile::text_edit(
+                            ui,
+                            "login_username",
+                            &mut self.username,
+                            crate::platform::InputKind::Text,
+                            field_w,
+                        );
+                        mobile::text_edit(
+                            ui,
+                            "login_password",
+                            &mut self.password,
+                            crate::platform::InputKind::Password,
+                            field_w,
+                        );
+                        login_clicked = ui
+                            .add_sized(
+                                egui::vec2(btn_w, mobile::TOUCH_HEIGHT),
+                                theme::primary_btn_enabled(btn_text, !self.login_busy),
+                            )
+                            .clicked();
+                    });
+                }
             } else {
                 // 桌面端固定两行：上行状态（IP/设备/账号），下行登录操作（输入靠左、按钮靠右）。
                 ui.horizontal_wrapped(draw_connection);
@@ -250,10 +277,75 @@ impl eframe::App for App {
             .show(ctx, |ui| {
             // 状态栏统一小字，整行同一字号。
             let small = |text: String| egui::RichText::new(text).small().color(theme::text_dim());
-            // 窄屏时右半区另起一行：`right_to_left` 嵌在 `horizontal_wrapped` 里
-            // 会在同一位置叠字（截图实测 460/360 下「检查更新」与状态文字重合）。
             let compact_bar = mobile::compact_ui(ui);
             let mut check_update_clicked = false;
+
+            if compact_bar {
+                // 手机端只保留一行：左侧状态（截断），右侧版本号 + 更新入口。
+                // 学期/违规/日志行数等次要信息收进 tooltip，避免底部被撑成三行。
+                let mut summary = format!("日志 {} 行", self.log.len());
+                if let Some(s) = &self.data_page.semester {
+                    summary.push_str(&format!(
+                        " · {} 有效 {}/{}",
+                        s.sname, s.semester_valid_count, s.semester_count
+                    ));
+                }
+                if let Some(c) = &self.data_page.cheat {
+                    summary.push_str(if c.is_clean() {
+                        " · 自查正常"
+                    } else {
+                        " · 已标记"
+                    });
+                }
+                let marked = self
+                    .data_page
+                    .cheat
+                    .as_ref()
+                    .map(|c| !c.is_clean())
+                    .unwrap_or(false);
+
+                ui.horizontal(|ui| {
+                    let right_w = 120.0;
+                    let left_w = (ui.available_width() - right_w).max(60.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(left_w, 18.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            let color = if marked { theme::err() } else { theme::text_dim() };
+                            let text = ui.painter().layout(
+                                self.status.clone(),
+                                egui::FontId::proportional(11.0),
+                                color,
+                                left_w,
+                            );
+                            ui.add(egui::Label::new(text).truncate());
+                        },
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            let resp = ui
+                                .add_enabled(
+                                    !(self.update.checking || self.update.downloading),
+                                    egui::Button::new(
+                                        egui::RichText::new("更新")
+                                            .small()
+                                            .color(theme::text_dim()),
+                                    )
+                                    .frame(false),
+                                );
+                            if resp.clicked() {
+                                check_update_clicked = true;
+                            }
+                            ui.label(small(format!("v{}", crate::platform::version_name())));
+                        },
+                    );
+                })
+                .response
+                .on_hover_text(summary);
+                return;
+            }
+
             ui.horizontal_wrapped(|ui| {
                 ui.label(small(format!("日志 {} 行", self.log.len())));
                 ui.separator();
@@ -280,22 +372,12 @@ impl eframe::App for App {
                 }
                 ui.separator();
                 ui.label(small(self.status.clone()));
-                // 宽屏：右半区靠右同排；窄屏：另起一行左对齐，避免叠字。
-                if !compact_bar {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if draw_right_side(ui, small, &self.update) {
-                            check_update_clicked = true;
-                        }
-                    });
-                }
-            });
-            if compact_bar {
-                ui.horizontal_wrapped(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if draw_right_side(ui, small, &self.update) {
                         check_update_clicked = true;
                     }
                 });
-            }
+            });
             if check_update_clicked {
                 self.check_update(true);
             }

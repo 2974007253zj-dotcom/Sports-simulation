@@ -23,6 +23,7 @@ public final class MainActivity extends NativeActivity {
     private native void nativeSubmitEdit(long id, String value);
     private native void nativeSetInsets(int left, int top, int right, int bottom);
     private native void nativeDeviceInfo(boolean initial, String info, String error);
+    private native void nativeSetDensity(float density);
 
     public void requestDeviceInfo(boolean initial) {
         runOnUiThread(() -> {
@@ -88,6 +89,24 @@ public final class MainActivity extends NativeActivity {
         });
         content.requestApplyInsets();
         applySystemBarStyle();
+        pushDensity();
+    }
+
+    /**
+     * 把屏幕密度告诉 Rust。
+     *
+     * egui 默认 pixels_per_point = 1.0，会把 1080px 宽的手机当成 1080 逻辑像素，
+     * 于是永远走桌面布局、界面错乱。传 density（如 2.75）后 1080px → 393dp。
+     */
+    private void pushDensity() {
+        float density = getResources().getDisplayMetrics().density;
+        if (density <= 0f) density = 1f;
+        nativeSetDensity(density);
+    }
+
+    @Override public void onConfigurationChanged(android.content.res.Configuration config) {
+        super.onConfigurationChanged(config);
+        pushDensity();
     }
 
     @Override public void onWindowFocusChanged(boolean hasFocus) {
@@ -196,6 +215,134 @@ public final class MainActivity extends NativeActivity {
                     android.widget.Toast.LENGTH_LONG).show();
             }
         });
+    }
+
+    // ── 文件读写（配置档位备份/迁移，与桌面端使用同一份 JSON 格式）────────
+    //
+    // Android 没有 rfd 后端，改用系统存储访问框架（SAF）：
+    //   ACTION_OPEN_DOCUMENT   让用户挑一个已存在的文件 → 读成字符串交给 Rust
+    //   ACTION_CREATE_DOCUMENT 让用户指定新文件名与位置 → Rust 把字符串写进去
+    // 结果通过 onActivityResult 回传，存进下面的静态字段供 Rust 轮询。
+
+    private static final int REQ_OPEN_PROFILES = 4101;
+    private static final int REQ_CREATE_PROFILES = 4102;
+
+    /** 待写入的内容；用户选完保存位置后写入。 */
+    private static volatile String pendingWrite = null;
+    /** 读取结果：done=true 时 text/error 有效。 */
+    private static volatile boolean readDone = false;
+    private static volatile String readText = "";
+    private static volatile String readError = "";
+    /** 写入结果。 */
+    private static volatile boolean writeDone = false;
+    private static volatile String writeError = "";
+
+    /** Rust 调用：弹出系统文件选择器，读取用户选中的文本文件。 */
+    public void pickFileForRead() {
+        readDone = false;
+        readText = "";
+        readError = "";
+        runOnUiThread(() -> {
+            try {
+                android.content.Intent intent = new android.content.Intent(
+                    android.content.Intent.ACTION_OPEN_DOCUMENT);
+                intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+                intent.setType("*/*");
+                intent.putExtra(android.content.Intent.EXTRA_MIME_TYPES,
+                    new String[]{"application/json", "text/plain", "*/*"});
+                startActivityForResult(intent, REQ_OPEN_PROFILES);
+            } catch (Exception error) {
+                readError = "无法打开文件选择器：" + error.getMessage();
+                readDone = true;
+            }
+        });
+    }
+
+    /** Rust 调用：弹出系统保存对话框，把 text 写到用户选定的文件。 */
+    public void pickFileForWrite(String suggestedName, String text) {
+        pendingWrite = text;
+        writeDone = false;
+        writeError = "";
+        runOnUiThread(() -> {
+            try {
+                android.content.Intent intent = new android.content.Intent(
+                    android.content.Intent.ACTION_CREATE_DOCUMENT);
+                intent.addCategory(android.content.Intent.CATEGORY_OPENABLE);
+                intent.setType("application/json");
+                intent.putExtra(android.content.Intent.EXTRA_TITLE, suggestedName);
+                startActivityForResult(intent, REQ_CREATE_PROFILES);
+            } catch (Exception error) {
+                pendingWrite = null;
+                writeError = "无法打开保存对话框：" + error.getMessage();
+                writeDone = true;
+            }
+        });
+    }
+
+    /** Rust 轮询读取结果；未完成时返回 null。格式：done text error */
+    public String takeReadResult() {
+        if (!readDone) return null;
+        readDone = false;
+        String text = readText;
+        String error = readError;
+        readText = "";
+        readError = "";
+        return "1 " + text + " " + error;
+    }
+
+    /** Rust 轮询写入结果；未完成时返回 null。 */
+    public String takeWriteResult() {
+        if (!writeDone) return null;
+        writeDone = false;
+        String error = writeError;
+        writeError = "";
+        return "1 " + error;
+    }
+
+    @Override protected void onActivityResult(int request, int result, android.content.Intent data) {
+        super.onActivityResult(request, result, data);
+        if (request != REQ_OPEN_PROFILES && request != REQ_CREATE_PROFILES) return;
+
+        boolean ok = result == android.app.Activity.RESULT_OK && data != null && data.getData() != null;
+        if (request == REQ_OPEN_PROFILES) {
+            if (!ok) {
+                readError = "已取消";
+                readDone = true;
+                return;
+            }
+            try {
+                java.io.InputStream in = getContentResolver().openInputStream(data.getData());
+                java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+                byte[] chunk = new byte[8192];
+                int n;
+                while ((n = in.read(chunk)) > 0) buf.write(chunk, 0, n);
+                in.close();
+                readText = new String(buf.toByteArray(), java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception error) {
+                readError = "读取失败：" + error.getMessage();
+            }
+            readDone = true;
+            return;
+        }
+
+        // 写入
+        if (!ok) {
+            pendingWrite = null;
+            writeError = "已取消";
+            writeDone = true;
+            return;
+        }
+        try {
+            java.io.OutputStream out = getContentResolver().openOutputStream(data.getData(), "wt");
+            out.write(pendingWrite == null ? new byte[0] : pendingWrite.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            out.flush();
+            out.close();
+        } catch (Exception error) {
+            writeError = "写入失败：" + error.getMessage();
+        } finally {
+            pendingWrite = null;
+        }
+        writeDone = true;
     }
 
     /** 当前 APK 的 versionName（与 Release tag 对齐，供更新检查比较）。 */
