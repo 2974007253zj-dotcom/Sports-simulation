@@ -161,4 +161,4 @@ cargo test --all
 
 ## 许可证
 
-[CC BY-NC 4.0](LICENSE) © YanamiNeko（禁止商用）
+[CC BY-NC 4.0](LICENSE) © YanamiNeko（禁止商用） 
