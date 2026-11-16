@@ -329,7 +329,9 @@ fn extract_zip(bytes: &[u8]) -> Result<Vec<u8>, String> {
         if f.is_dir() {
             continue;
         }
-        let is_exe = std::path::Path::new(f.name())
+        // zip 9 起 name() 返回 Result<Cow<str>>：文件名不是合法 UTF-8/CP437 时报错。
+        let entry_name = f.name().map_err(|e| format!("zip 文件名无效: {e}"))?;
+        let is_exe = std::path::Path::new(entry_name.as_ref())
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.eq_ignore_ascii_case("exe"))
